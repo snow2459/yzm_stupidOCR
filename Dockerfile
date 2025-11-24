@@ -21,7 +21,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && apt-get install -y --no-install-recommends gcc \
     && pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple \
     && apt-get purge -y --auto-remove gcc \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && find /usr/local/lib/python3.9 -name "__pycache__" -type d -prune -exec rm -rf {} +
 
 # 复制代码
 COPY . .
