@@ -9,6 +9,9 @@ import base64
 import re
 import json
 import secrets
+import sqlite3
+import threading
+import time
 from io import BytesIO
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, status
@@ -20,7 +23,7 @@ from datetime import datetime
 from typing import Optional, List, Dict
 
 # ==================== 配置 ====================
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.2.0"
 APP_DESCRIPTION = """
 * 增强版DDDDOCR
 
@@ -38,7 +41,8 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "yzm_admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "7jnyxx54")
 
 # 文件路径
-TOKEN_FILE = os.path.join(os.path.dirname(__file__), ".token_config.json")
+BASE_DIR = os.path.dirname(__file__)
+TOKEN_DB_PATH = os.environ.get("TOKEN_DB_PATH", os.path.join(BASE_DIR, "tokens.db"))
 
 # 全局对象
 app = FastAPI(
@@ -147,40 +151,95 @@ def extract_text_from_probability(result: Dict) -> str:
 
 # ==================== Token 管理 ====================
 
-def load_tokens() -> List[Dict]:
-    """从文件加载所有 token"""
+token_cache: List[Dict] = []
+token_value_cache = set()
+token_value_map: Dict[str, Dict] = {}
+token_cache_lock = threading.Lock()
+rate_limit_state: Dict[str, Dict] = {}
+rate_limit_lock = threading.Lock()
+
+
+def get_db_connection() -> sqlite3.Connection:
+    """获取 SQLite 连接"""
+    conn = sqlite3.connect(TOKEN_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def load_tokens_from_db() -> List[Dict]:
+    """从 SQLite 读取所有 Token"""
+    conn = get_db_connection()
+    cursor = conn.execute("""
+        SELECT id, token, name, created_at, updated_at, minute_limit, hour_limit
+        FROM tokens
+        ORDER BY id ASC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [
+        {
+            'id': str(row['id']),
+            'token': row['token'],
+            'name': row['name'] or f"Token {row['id']}",
+            'created_at': row['created_at'] or "",
+            'updated_at': row['updated_at'] or row['created_at'] or "",
+            'minute_limit': row['minute_limit'],
+            'hour_limit': row['hour_limit']
+        }
+        for row in rows
+    ]
+
+
+def refresh_token_cache():
+    """刷新 Token 缓存"""
+    global token_cache, token_value_cache, token_value_map, rate_limit_state
+    tokens = load_tokens_from_db()
+    with token_cache_lock:
+        token_cache = tokens
+        token_value_cache = {t['token'] for t in tokens if t.get('token')}
+        token_value_map = {t['token']: t for t in tokens if t.get('token')}
+        # 清理已删除 token 的限流状态
+        rate_limit_state = {k: v for k, v in rate_limit_state.items() if k in token_value_cache}
+
+
+def init_db():
+    """初始化 SQLite 数据库并加载缓存"""
+    db_dir = os.path.dirname(TOKEN_DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+    
+    conn = get_db_connection()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT NOT NULL,
+            name TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            minute_limit INTEGER,
+            hour_limit INTEGER
+        )
+    """)
+    # 兼容旧表，补充限流字段
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(tokens)").fetchall()}
+    if 'minute_limit' not in existing_columns:
+        conn.execute("ALTER TABLE tokens ADD COLUMN minute_limit INTEGER")
+    if 'hour_limit' not in existing_columns:
+        conn.execute("ALTER TABLE tokens ADD COLUMN hour_limit INTEGER")
+    conn.commit()
+    conn.close()
+    
+    refresh_token_cache()
     try:
-        if os.path.exists(TOKEN_FILE):
-            with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                # 兼容旧格式
-                if 'token' in config and isinstance(config['token'], str):
-                    return [{
-                        'id': '1',
-                        'token': config['token'],
-                        'name': '默认 Token',
-                        'created_at': config.get('updated_at', datetime.now().isoformat()),
-                        'updated_at': config.get('updated_at', datetime.now().isoformat())
-                    }]
-                return config.get('tokens', [])
+        os.chmod(TOKEN_DB_PATH, 0o600)
     except Exception:
         pass
-    return []
 
 
-def save_tokens(tokens: List[Dict]) -> bool:
-    """保存所有 token 到文件"""
-    try:
-        config = {
-            'tokens': tokens,
-            'updated_at': datetime.now().isoformat()
-        }
-        with open(TOKEN_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        os.chmod(TOKEN_FILE, 0o600)
-        return True
-    except Exception:
-        return False
+def load_tokens() -> List[Dict]:
+    """返回缓存中的 Token 列表"""
+    with token_cache_lock:
+        return [t.copy() for t in token_cache]
 
 
 def generate_token() -> str:
@@ -205,20 +264,144 @@ def verify_session(session_id: Optional[str]) -> bool:
     return session_id is not None and session_id in admin_sessions
 
 
+def get_token_by_id(token_id: str) -> Optional[Dict]:
+    """从缓存获取指定 Token"""
+    token_id = str(token_id)
+    with token_cache_lock:
+        for token in token_cache:
+            if token.get('id') == token_id:
+                return token.copy()
+    return None
+
+
+def enforce_rate_limit(token_value: str, minute_limit: Optional[int], hour_limit: Optional[int]):
+    """
+    针对 Token 进行分钟与小时级限流
+    - minute_limit: 每分钟最大请求数，None 表示不限
+    - hour_limit: 每小时最大请求数，None 表示不限
+    """
+    now = time.time()
+    minute_bucket = int(now // 60)
+    hour_bucket = int(now // 3600)
+    
+    with rate_limit_lock:
+        state = rate_limit_state.get(token_value, {
+            'minute_bucket': minute_bucket,
+            'minute_count': 0,
+            'hour_bucket': hour_bucket,
+            'hour_count': 0
+        })
+        
+        if state['minute_bucket'] != minute_bucket:
+            state['minute_bucket'] = minute_bucket
+            state['minute_count'] = 0
+        if state['hour_bucket'] != hour_bucket:
+            state['hour_bucket'] = hour_bucket
+            state['hour_count'] = 0
+        
+        if minute_limit is not None and state['minute_count'] >= minute_limit:
+            raise HTTPException(status_code=429, detail=f"已超过每分钟 {minute_limit} 次的限流")
+        if hour_limit is not None and state['hour_count'] >= hour_limit:
+            raise HTTPException(status_code=429, detail=f"已超过每小时 {hour_limit} 次的限流")
+        
+        state['minute_count'] += 1
+        state['hour_count'] += 1
+        rate_limit_state[token_value] = state
+
+
+def add_token_record(token_value: str, name: str, minute_limit: Optional[int] = None, hour_limit: Optional[int] = None) -> Dict:
+    """新增 Token 记录"""
+    now = datetime.now().isoformat()
+    conn = get_db_connection()
+    cursor = conn.execute(
+        """
+        INSERT INTO tokens (token, name, created_at, updated_at, minute_limit, hour_limit)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (token_value, name, now, now, minute_limit, hour_limit)
+    )
+    conn.commit()
+    new_id = str(cursor.lastrowid)
+    conn.close()
+    refresh_token_cache()
+    return get_token_by_id(new_id) or {
+        'id': new_id,
+        'token': token_value,
+        'name': name,
+        'created_at': now,
+        'updated_at': now
+    }
+
+
+def update_token_record(
+    token_id: str,
+    token_value: Optional[str] = None,
+    name: Optional[str] = None,
+    minute_limit: Optional[int] = None,
+    hour_limit: Optional[int] = None
+) -> Optional[Dict]:
+    """更新 Token 记录"""
+    now = datetime.now().isoformat()
+    conn = get_db_connection()
+    cursor = conn.execute(
+        """
+        UPDATE tokens
+        SET token = ?,
+            name = ?,
+            minute_limit = ?,
+            hour_limit = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (token_value, name, minute_limit, hour_limit, now, token_id)
+    )
+    conn.commit()
+    conn.close()
+    if cursor.rowcount == 0:
+        return None
+    refresh_token_cache()
+    return get_token_by_id(str(token_id))
+
+
+def delete_token_record(token_id: str) -> bool:
+    """删除 Token 记录"""
+    conn = get_db_connection()
+    cursor = conn.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
+    conn.commit()
+    conn.close()
+    if cursor.rowcount > 0:
+        refresh_token_cache()
+        return True
+    return False
+
+
 async def verify_token(x_token: Optional[str] = Header(None, alias="X-Token")):
     """验证 token 的依赖函数"""
     if not x_token:
         raise HTTPException(status_code=403, detail="缺少 Token，请在请求头中添加 X-Token")
     
-    tokens = load_tokens()
-    if not tokens:
+    with token_cache_lock:
+        cached_tokens = list(token_cache)
+        cached_token_values = set(token_value_cache)
+        token_config = token_value_map.get(x_token)
+    
+    if not cached_tokens:
         raise HTTPException(status_code=403, detail="Token 未配置，请先访问管理界面配置 Token")
     
-    token_values = [t.get('token') for t in tokens]
-    if x_token not in token_values:
+    if x_token not in cached_token_values or not token_config:
         raise HTTPException(status_code=403, detail="Token 验证失败")
     
+    enforce_rate_limit(
+        x_token,
+        token_config.get('minute_limit'),
+        token_config.get('hour_limit')
+    )
+    
     return x_token
+
+
+# 初始化数据库与缓存
+init_db()
 
 # ==================== 数据模型 ====================
 
@@ -263,6 +446,20 @@ class TokenConfigModel(BaseModel):
     """Token 配置模型"""
     token: Optional[str] = Field(None, description="Token 值，留空则自动生成")
     name: Optional[str] = Field(None, description="Token 名称")
+    minute_limit: Optional[int] = Field(None, description="每分钟限流次数，空为不限")
+    hour_limit: Optional[int] = Field(None, description="每小时限流次数，空为不限")
+    
+    @validator('minute_limit', 'hour_limit', pre=True)
+    def validate_limit(cls, v):
+        if v in (None, '', 'null'):
+            return None
+        try:
+            v_int = int(v)
+        except Exception:
+            raise ValueError("限流值必须为整数或留空")
+        if v_int <= 0:
+            return None
+        return v_int
 
 
 class TokenUpdateModel(BaseModel):
@@ -270,6 +467,20 @@ class TokenUpdateModel(BaseModel):
     token_id: str
     token: Optional[str] = Field(None, description="Token 值")
     name: Optional[str] = Field(None, description="Token 名称")
+    minute_limit: Optional[int] = Field(None, description="每分钟限流次数，空为不限")
+    hour_limit: Optional[int] = Field(None, description="每小时限流次数，空为不限")
+    
+    @validator('minute_limit', 'hour_limit', pre=True)
+    def validate_limit(cls, v):
+        if v in (None, '', 'null'):
+            return None
+        try:
+            v_int = int(v)
+        except Exception:
+            raise ValueError("限流值必须为整数或留空")
+        if v_int <= 0:
+            return None
+        return v_int
 
 # ==================== OCR API 路由 ====================
 
@@ -504,6 +715,9 @@ async def admin_page(request: Request):
     
     # 生成 token 列表 HTML
     token_list_html = ""
+    def format_limit(value: Optional[int]) -> str:
+        return "不限" if value is None else f"{value} 次"
+    
     if tokens:
         for token in tokens:
             token_id = token.get('id', '')
@@ -511,10 +725,19 @@ async def admin_page(request: Request):
             token_value = token.get('token', '')
             token_display = token_value[:20] + '...' if len(token_value) > 20 else token_value
             created_at = token.get('created_at', '')
+            minute_limit = format_limit(token.get('minute_limit'))
+            hour_limit = format_limit(token.get('hour_limit'))
             token_list_html += f"""
             <tr>
                 <td>{token_name}</td>
-                <td><code style="font-size: 11px;">{token_display}</code></td>
+                <td>
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <code style="font-size: 11px;">{token_display}</code>
+                        <button class="btn-copy" onclick="copyToken('{token_id}')">复制</button>
+                    </div>
+                </td>
+                <td>{minute_limit}</td>
+                <td>{hour_limit}</td>
                 <td>{created_at[:10] if created_at else '-'}</td>
                 <td>
                     <button class="btn-edit" onclick="editToken('{token_id}')">编辑</button>
@@ -523,7 +746,7 @@ async def admin_page(request: Request):
             </tr>
             """
     else:
-        token_list_html = '<tr><td colspan="4" style="text-align: center; color: #999;">暂无 Token</td></tr>'
+        token_list_html = '<tr><td colspan="6" style="text-align: center; color: #999;">暂无 Token</td></tr>'
     
     # 读取模板文件
     template_path = os.path.join(os.path.dirname(__file__), "admin_template.html")
@@ -564,8 +787,6 @@ async def create_token(config: TokenConfigModel, request: Request):
     if not verify_session(session_id):
         raise HTTPException(status_code=401, detail="未授权")
     
-    tokens = load_tokens()
-    
     if config.token:
         token_value = config.token.strip()
         if len(token_value) < 16:
@@ -573,21 +794,15 @@ async def create_token(config: TokenConfigModel, request: Request):
     else:
         token_value = generate_token()
     
-    new_id = str(max([int(t.get('id', '0')) for t in tokens] + [0]) + 1)
-    new_token = {
-        'id': new_id,
-        'token': token_value,
-        'name': config.name or f'Token {new_id}',
-        'created_at': datetime.now().isoformat(),
-        'updated_at': datetime.now().isoformat()
-    }
+    token_name = config.name or f'Token {len(load_tokens()) + 1}'
+    minute_limit = config.minute_limit
+    hour_limit = config.hour_limit
     
-    tokens.append(new_token)
-    
-    if save_tokens(tokens):
+    try:
+        new_token = add_token_record(token_value, token_name, minute_limit, hour_limit)
         return {"success": True, "token": new_token, "message": "Token 已创建"}
-    else:
-        raise HTTPException(status_code=500, detail="保存 Token 失败")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"保存 Token 失败: {str(e)}")
 
 
 @app.put("/api/admin/token")
@@ -597,32 +812,35 @@ async def update_token(config: TokenUpdateModel, request: Request):
     if not verify_session(session_id):
         raise HTTPException(status_code=401, detail="未授权")
     
-    tokens = load_tokens()
-    token_index = None
-    
-    for i, token in enumerate(tokens):
-        if token.get('id') == config.token_id:
-            token_index = i
-            break
-    
-    if token_index is None:
+    existing_token = get_token_by_id(config.token_id)
+    if not existing_token:
         raise HTTPException(status_code=404, detail="Token 不存在")
     
-    if config.token:
-        token_value = config.token.strip()
+    payload = config.dict(exclude_unset=True)
+    
+    new_token_value = existing_token.get('token')
+    if 'token' in payload and payload.get('token'):
+        token_value = payload.get('token').strip()
         if len(token_value) < 16:
             raise HTTPException(status_code=400, detail="Token 长度至少需要 16 个字符")
-        tokens[token_index]['token'] = token_value
+        new_token_value = token_value
     
-    if config.name:
-        tokens[token_index]['name'] = config.name
+    new_name = payload.get('name', existing_token.get('name'))
+    new_minute_limit = payload.get('minute_limit') if 'minute_limit' in payload else existing_token.get('minute_limit')
+    new_hour_limit = payload.get('hour_limit') if 'hour_limit' in payload else existing_token.get('hour_limit')
     
-    tokens[token_index]['updated_at'] = datetime.now().isoformat()
+    updated_token = update_token_record(
+        config.token_id,
+        new_token_value,
+        new_name,
+        new_minute_limit,
+        new_hour_limit
+    )
     
-    if save_tokens(tokens):
-        return {"success": True, "token": tokens[token_index], "message": "Token 已更新"}
-    else:
+    if not updated_token:
         raise HTTPException(status_code=500, detail="更新 Token 失败")
+    
+    return {"success": True, "token": updated_token, "message": "Token 已更新"}
 
 
 @app.delete("/api/admin/token/{token_id}")
@@ -632,10 +850,10 @@ async def delete_token(token_id: str, request: Request):
     if not verify_session(session_id):
         raise HTTPException(status_code=401, detail="未授权")
     
-    tokens = load_tokens()
-    tokens = [t for t in tokens if t.get('id') != token_id]
+    if not get_token_by_id(token_id):
+        raise HTTPException(status_code=404, detail="Token 不存在")
     
-    if save_tokens(tokens):
+    if delete_token_record(token_id):
         return {"success": True, "message": "Token 已删除"}
     else:
         raise HTTPException(status_code=500, detail="删除 Token 失败")
@@ -666,9 +884,7 @@ async def get_token(token_id: str, request: Request):
     if not verify_session(session_id):
         raise HTTPException(status_code=401, detail="未授权")
     
-    tokens = load_tokens()
-    token = next((t for t in tokens if t.get('id') == token_id), None)
-    
+    token = get_token_by_id(token_id)
     if not token:
         raise HTTPException(status_code=404, detail="Token 不存在")
     

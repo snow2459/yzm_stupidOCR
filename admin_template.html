@@ -103,6 +103,19 @@
         .btn-delete:hover {
             background: #c82333;
         }
+        .btn-copy {
+            padding: 4px 8px;
+            border: 1px solid #667eea;
+            border-radius: 4px;
+            background: white;
+            color: #667eea;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .btn-copy:hover {
+            background: #667eea;
+            color: white;
+        }
         .add-token-section {
             background: #f5f5f5;
             padding: 20px;
@@ -126,7 +139,14 @@
             border-radius: 6px;
             font-size: 14px;
         }
-        input[type="text"]:focus {
+        input[type="number"] {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        input[type="text"]:focus, input[type="number"]:focus {
             outline: none;
             border-color: #667eea;
         }
@@ -233,6 +253,14 @@
                     <label for="tokenValue">Token 值（留空将自动生成）</label>
                     <input type="text" id="tokenValue" placeholder="留空将自动生成安全的随机 Token">
                 </div>
+                <div class="form-group">
+                    <label for="minuteLimit">每分钟限流（次数，留空为不限）</label>
+                    <input type="number" id="minuteLimit" min="1" placeholder="如 60，留空为不限">
+                </div>
+                <div class="form-group">
+                    <label for="hourLimit">每小时限流（次数，留空为不限）</label>
+                    <input type="number" id="hourLimit" min="1" placeholder="如 1000，留空为不限">
+                </div>
                 <div class="button-group">
                     <button type="submit" class="btn-primary">添加 Token</button>
                     <button type="button" class="btn-secondary" onclick="generateToken()">生成随机 Token</button>
@@ -245,6 +273,8 @@
                 <tr>
                     <th>名称</th>
                     <th>Token</th>
+                    <th>每分钟</th>
+                    <th>每小时</th>
                     <th>创建时间</th>
                     <th>操作</th>
                 </tr>
@@ -274,6 +304,14 @@
                     <label for="editTokenValue">Token 值</label>
                     <input type="text" id="editTokenValue" required>
                 </div>
+                <div class="form-group">
+                    <label for="editMinuteLimit">每分钟限流（次数，留空为不限）</label>
+                    <input type="number" id="editMinuteLimit" min="1" placeholder="留空为不限">
+                </div>
+                <div class="form-group">
+                    <label for="editHourLimit">每小时限流（次数，留空为不限）</label>
+                    <input type="number" id="editHourLimit" min="1" placeholder="留空为不限">
+                </div>
                 <div class="button-group">
                     <button type="submit" class="btn-primary">保存</button>
                     <button type="button" class="btn-secondary" onclick="closeEditModal()">取消</button>
@@ -296,18 +334,31 @@
             }
         }
         
+        // 格式化限流显示
+        function formatLimit(value) {
+            if (value === null || value === undefined) return '不限';
+            return `${value} 次`;
+        }
+        
         // 渲染 token 表格
         function renderTokenTable(tokens) {
             const tbody = document.getElementById('tokenTableBody');
             if (tokens.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #999;">暂无 Token</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #999;">暂无 Token</td></tr>';
                 return;
             }
             
             tbody.innerHTML = tokens.map(token => `
                 <tr>
                     <td>${token.name || '未命名'}</td>
-                    <td><code style="font-size: 11px;">${token.token}</code></td>
+                    <td>
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <code style="font-size: 11px;">${token.token}</code>
+                            <button class="btn-copy" onclick="copyToken('${token.id}')">复制</button>
+                        </div>
+                    </td>
+                    <td>${formatLimit(token.minute_limit)}</td>
+                    <td>${formatLimit(token.hour_limit)}</td>
                     <td>${token.created_at ? token.created_at.substring(0, 10) : '-'}</td>
                     <td>
                         <button class="btn-edit" onclick="editToken('${token.id}')">编辑</button>
@@ -317,18 +368,60 @@
             `).join('');
         }
         
+        // 复制 Token
+        async function copyToken(tokenId) {
+            const response = await fetch(`/api/admin/token/${tokenId}`);
+            if (!response.ok) {
+                if (response.status === 401) {
+                    window.location.href = '/admin/login';
+                }
+                showMessage('获取 Token 失败', 'error');
+                return;
+            }
+            const data = await response.json();
+            const token = data.token?.token;
+            if (!token) {
+                showMessage('未找到 Token', 'error');
+                return;
+            }
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(token);
+                } else {
+                    const textarea = document.createElement('textarea');
+                    textarea.value = token;
+                    document.body.appendChild(textarea);
+                    textarea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(textarea);
+                }
+                showMessage('已复制 Token', 'success');
+            } catch (err) {
+                showMessage('复制失败，请手动复制', 'error');
+            }
+        }
+        
         // 添加 token
         document.getElementById('addTokenForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             const name = document.getElementById('tokenName').value.trim();
             const token = document.getElementById('tokenValue').value.trim();
+            const minuteLimitRaw = document.getElementById('minuteLimit').value.trim();
+            const hourLimitRaw = document.getElementById('hourLimit').value.trim();
+            const minute_limit = minuteLimitRaw ? parseInt(minuteLimitRaw, 10) : null;
+            const hour_limit = hourLimitRaw ? parseInt(hourLimitRaw, 10) : null;
             
             const response = await fetch('/api/admin/token', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ name: name || null, token: token || null })
+                body: JSON.stringify({
+                    name: name || null,
+                    token: token || null,
+                    minute_limit: minute_limit,
+                    hour_limit: hour_limit
+                })
             });
             
             const data = await response.json();
@@ -361,6 +454,8 @@
             document.getElementById('editTokenId').value = tokenId;
             document.getElementById('editTokenName').value = token.name || '';
             document.getElementById('editTokenValue').value = token.token || '';
+            document.getElementById('editMinuteLimit').value = token.minute_limit ?? '';
+            document.getElementById('editHourLimit').value = token.hour_limit ?? '';
             document.getElementById('editModal').style.display = 'flex';
         }
         
@@ -370,13 +465,23 @@
             const tokenId = document.getElementById('editTokenId').value;
             const name = document.getElementById('editTokenName').value.trim();
             const token = document.getElementById('editTokenValue').value.trim();
+            const minuteLimitRaw = document.getElementById('editMinuteLimit').value.trim();
+            const hourLimitRaw = document.getElementById('editHourLimit').value.trim();
+            const minute_limit = minuteLimitRaw ? parseInt(minuteLimitRaw, 10) : null;
+            const hour_limit = hourLimitRaw ? parseInt(hourLimitRaw, 10) : null;
             
             const response = await fetch('/api/admin/token', {
                 method: 'PUT',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ token_id: tokenId, name: name, token: token || null })
+                body: JSON.stringify({
+                    token_id: tokenId,
+                    name: name,
+                    token: token || null,
+                    minute_limit: minute_limit,
+                    hour_limit: hour_limit
+                })
             });
             
             const data = await response.json();
@@ -448,4 +553,3 @@
     </script>
 </body>
 </html>
-
