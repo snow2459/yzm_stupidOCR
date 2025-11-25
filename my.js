@@ -27,6 +27,7 @@
 
     // ==================== 配置和常量 ====================
     var baseUrl = "http://localhost:6688";
+    var RETRY_DELAY_MS = 1000; // 请求失败后的重试间隔，避免高频重试
     
     // 限流配置
     var RATE_LIMIT_WINDOW = 10000; // 10秒
@@ -782,6 +783,12 @@
             "X-Token": token
         };
 
+        function handleErrorWithDelay(code) {
+            if (typeof onError === "function") {
+                setTimeout(function() { onError(code); }, RETRY_DELAY_MS);
+            }
+        }
+
         GM_xmlhttpRequest({
             method: "POST",
             url: baseUrl + url,
@@ -797,27 +804,27 @@
                             if (onSuccess) onSuccess(result);
                         } else {
                             console.log("【我的验证码识别】识别结果为空或无效:", result);
-                            if (onError) onError("empty_result");
+                            handleErrorWithDelay("empty_result");
                         }
                     }
                     catch (e) {
                         console.log("【我的验证码识别】解析响应失败:", e);
-                        if (onError) onError("parse_error");
+                        handleErrorWithDelay("parse_error");
                     }
                 }
                 else if (response.status == 403) {
                     // Token 验证失败
                     topNotice("Token 验证失败，请检查 Token 配置", "error");
-                    if (onError) onError("token_invalid");
+                    handleErrorWithDelay("token_invalid");
                 }
                 else {
                     console.log("【我的验证码识别】请求失败，状态码:", response.status);
-                    if (onError) onError("request_failed");
+                    handleErrorWithDelay("request_failed");
                 }
             },
             onerror: function(error) {
                 topNotice("请求失败，请检查服务是否正常运行", "error");
-                if (onError) onError("network_error");
+                handleErrorWithDelay("network_error");
             }
         });
     }
