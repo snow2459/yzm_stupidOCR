@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         我的验证码识别脚本
+// @name         token版
 // @namespace    http://tampermonkey.net/
 // @version      0.1
 // @author       You
@@ -35,8 +35,95 @@
     GM_registerMenuCommand('管理网页黑名单', manageBlackList);
     GM_registerMenuCommand('导入规则', importRules);
     GM_registerMenuCommand('导出规则', exportRules);
+    GM_registerMenuCommand('配置 Token', configureToken);
 
     GM_setValue("preCode", "");
+
+    // 限流配置（10秒50次）
+    var RATE_LIMIT_WINDOW = 10000; // 10秒
+    var RATE_LIMIT_MAX_REQUESTS = 50; // 最大50次
+    var requestHistory = []; // 请求历史记录
+
+    // 限流管理器
+    function checkRateLimit() {
+        var now = Date.now();
+        // 清理过期记录
+        requestHistory = requestHistory.filter(function(timestamp) {
+            return now - timestamp < RATE_LIMIT_WINDOW;
+        });
+        
+        // 检查是否超过限制
+        if (requestHistory.length >= RATE_LIMIT_MAX_REQUESTS) {
+            var oldestRequest = requestHistory[0];
+            var waitTime = RATE_LIMIT_WINDOW - (now - oldestRequest);
+            return {
+                allowed: false,
+                waitTime: Math.ceil(waitTime / 1000) // 转换为秒
+            };
+        }
+        
+        // 记录本次请求
+        requestHistory.push(now);
+        return { allowed: true };
+    }
+
+    // Token 配置功能
+    function configureToken() {
+        var currentToken = GM_getValue("ocrToken", "");
+        var div = document.createElement("div");
+        div.style.cssText = 'width: 500px; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background-color: white; border: 2px solid #667eea; z-index: 9999999999; text-align: center; padding: 30px; box-shadow: 0px 0px 20px 0px rgba(0,0,0,0.5); border-radius: 10px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;';
+        div.innerHTML = '<h3 style="margin-bottom: 20px; color: #333; font-size: 18px;">🔐 配置 OCR Token</h3>' +
+            '<p style="color: #666; font-size: 13px; margin-bottom: 15px; text-align: left;">请在管理界面 (http://localhost:6688/admin) 配置 Token 后，将 Token 粘贴到下方：</p>' +
+            '<input type="text" id="tokenInput" placeholder="请输入 Token" style="width: 100%; padding: 10px; border: 2px solid #e0e0e0; border-radius: 6px; font-size: 14px; margin-bottom: 15px; box-sizing: border-box;" value="' + (currentToken ? '••••••••' : '') + '">' +
+            '<div style="display: flex; gap: 10px;">' +
+            '<button id="saveToken" style="flex: 1; padding: 10px; background: #667eea; color: white; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; font-weight: 500;">保存</button>' +
+            '<button id="clearToken" style="flex: 1; padding: 10px; background: #dc3545; color: white; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; font-weight: 500;">清除</button>' +
+            '<button id="closeToken" style="flex: 1; padding: 10px; background: #6c757d; color: white; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; font-weight: 500;">关闭</button>' +
+            '</div>' +
+            '<p style="color: #999; font-size: 12px; margin-top: 15px; text-align: left;">提示：Token 用于验证 API 访问权限，未配置或错误的 Token 将导致识别失败</p>';
+        document.body.appendChild(div);
+
+        var tokenInput = document.getElementById("tokenInput");
+        var saveBtn = document.getElementById("saveToken");
+        var clearBtn = document.getElementById("clearToken");
+        var closeBtn = document.getElementById("closeToken");
+
+        // 如果已有 token，点击输入框显示真实值
+        if (currentToken) {
+            tokenInput.addEventListener('focus', function() {
+                if (this.value === '••••••••') {
+                    this.value = currentToken;
+                }
+            });
+        }
+
+        saveBtn.onclick = function() {
+            var token = tokenInput.value.trim();
+            if (!token) {
+                topNotice("Token 不能为空", "error");
+                return;
+            }
+            GM_setValue("ocrToken", token);
+            topNotice("Token 保存成功", "success");
+            setTimeout(function() {
+                div.remove();
+            }, 1000);
+        };
+
+        clearBtn.onclick = function() {
+            if (confirm("确定要清除 Token 吗？")) {
+                GM_setValue("ocrToken", "");
+                topNotice("Token 已清除", "success");
+                setTimeout(function() {
+                    div.remove();
+                }, 1000);
+            }
+        };
+
+        closeBtn.onclick = function() {
+            div.remove();
+        };
+    }
 
     function importRules() {
         var input = document.createElement('input');
@@ -548,68 +635,147 @@
     }
 
     function writeIn(ans, code) {
-        if (!ans) {
+        // 检查结果是否有效
+        if (!ans || (typeof ans !== 'string' && typeof ans !== 'number')) {
+            console.log("【我的验证码识别】writeIn: 结果无效", ans);
             return;
         }
-        if (code && GM_getValue("preCode", "") !== code) {
+        // 转换为字符串并清理
+        ans = String(ans).replace(/\s+/g, "");
+        if (!ans || ans.length === 0) {
+            console.log("【我的验证码识别】writeIn: 结果为空");
             return;
         }
+        
+        // 检查验证码是否匹配：使用 lastRequestedCode 而不是 preCode
+        // 如果 code 存在且与 lastRequestedCode 不一致，说明验证码已更新
+        if (code && lastRequestedCode && lastRequestedCode !== code) {
+            console.log("【我的验证码识别】writeIn: 验证码已更新，跳过写入 (code:", code, "lastRequestedCode:", lastRequestedCode, ")");
+            return;
+        }
+        
         if (findInput()) {
-            ans = ans.replace(/\s+/g, "");
-            input.value = ans;
-            if (typeof (InputEvent) !== "undefined") {
+            // 如果输入框为空，或者当前值不等于识别结果，则允许写入
+            var currentValue = (input.value || "").trim();
+            if (currentValue === "" || currentValue !== ans) {
+                console.log("【我的验证码识别】writeIn: 写入结果", ans, "(当前值:", currentValue, ")");
                 input.value = ans;
-                input.dispatchEvent(new InputEvent('input'));
-                var eventList = ['input', 'change', 'focus', 'keypress', 'keyup', 'keydown', 'select'];
-                for (var i = 0; i < eventList.length; i++) {
-                    fire(input, eventList[i]);
+                if (typeof (InputEvent) !== "undefined") {
+                    input.value = ans;
+                    input.dispatchEvent(new InputEvent('input'));
+                    var eventList = ['input', 'change', 'focus', 'keypress', 'keyup', 'keydown', 'select'];
+                    for (var i = 0; i < eventList.length; i++) {
+                        fire(input, eventList[i]);
+                    }
+                    input.value = ans;
                 }
-                input.value = ans;
+                else if (KeyboardEvent) {
+                    input.dispatchEvent(new KeyboardEvent("input"));
+                }
+            } else {
+                console.log("【我的验证码识别】writeIn: 输入框已有相同值，跳过写入");
             }
-            else if (KeyboardEvent) {
-                input.dispatchEvent(new KeyboardEvent("input"));
-            }
+        } else {
+            console.log("【我的验证码识别】writeIn: 未找到输入框");
         }
+    }
+
+    // 通用请求函数，包含 token 和限流检查
+    function makeOCRRequest(url, data, onSuccess, onError) {
+        // 检查限流
+        var rateLimitCheck = checkRateLimit();
+        if (!rateLimitCheck.allowed) {
+            topNotice("请求过于频繁，请等待 " + rateLimitCheck.waitTime + " 秒后再试", "warning");
+            if (onError) onError("rate_limit");
+            return;
+        }
+
+        // 获取 token
+        var token = GM_getValue("ocrToken", "");
+        if (!token) {
+            topNotice("未配置 Token，请通过菜单配置 Token", "error");
+            if (onError) onError("no_token");
+            return;
+        }
+
+        var headers = {
+            "Content-Type": "application/json",
+            "X-Token": token
+        };
+
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: baseUrl + url,
+            data: JSON.stringify(data),
+            headers: headers,
+            responseType: "json",
+            onload: function (response) {
+                if (response.status == 200) {
+                    try {
+                        var result = response.response["result"];
+                        // 确保结果不为空且是有效字符串
+                        if (result && typeof result === 'string' && result.trim().length > 0) {
+                            if (onSuccess) onSuccess(result);
+                        } else {
+                            console.log("【我的验证码识别】识别结果为空或无效:", result);
+                            if (onError) onError("empty_result");
+                        }
+                    }
+                    catch (e) {
+                        console.log("【我的验证码识别】解析响应失败:", e);
+                        if (onError) onError("parse_error");
+                    }
+                }
+                else if (response.status == 403) {
+                    // Token 验证失败
+                    topNotice("Token 验证失败，请检查 Token 配置", "error");
+                    if (onError) onError("token_invalid");
+                }
+                else {
+                    console.log("【我的验证码识别】请求失败，状态码:", response.status);
+                    if (onError) onError("request_failed");
+                }
+            },
+            onerror: function(error) {
+                topNotice("请求失败，请检查服务是否正常运行", "error");
+                if (onError) onError("network_error");
+            }
+        });
     }
 
     function p(code, i) {
         return new Promise((resolve) => {
             const datas = {
                 "img_base64": String(code),
-            }
-            GM_xmlhttpRequest({
-                method: "POST",
-                url: baseUrl + "/api/ocr/image",
-                data: JSON.stringify(datas),
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                responseType: "json",
-                onload: function (response) {
-                    if (response.status == 200) {
-                        try {
-                            var result = response.response["result"];
-                            return resolve(result);
-                        }
-                        catch (e) {
-                            return resolve("");
-                        }
+            };
+            makeOCRRequest("/api/ocr/image", datas, 
+                function(result) {
+                    // 确保结果有效
+                    if (result && (typeof result === 'string' || typeof result === 'number')) {
+                        console.log("【我的验证码识别】p: 识别成功", result);
+                        resolve(String(result));
+                    } else {
+                        console.log("【我的验证码识别】p: 识别结果无效", result);
+                        resolve("");
                     }
-                    else {
+                },
+                function(error) {
+                    console.log("【我的验证码识别】p: 请求失败", error);
+                    if (error === "token_invalid" || error === "no_token") {
+                        // Token 问题，不继续尝试
+                        resolve("");
+                    } else {
+                        // 其他错误，尝试下一个
                         try {
-                            if (response.response["result"] == null) {
+                            if (i !== undefined) {
                                 findCode(i + 1);
                             }
+                        } catch (err) {
                         }
-                        catch (err) {
-                        }
-                        return resolve("");
+                        resolve("");
                     }
-                },
-                onerror: function(error) {
-                    return resolve("");
                 }
-            });
+            );
         });
     }
 
@@ -618,33 +784,23 @@
             return new Promise((resolve) => {
                 const datas = {
                     "img_base64": String(code),
-                }
-                GM_xmlhttpRequest({
-                    method: "POST",
-                    url: baseUrl + "/api/ocr/image",
-                    data: JSON.stringify(datas),
-                    headers: {
-                        "Content-Type": "application/json"
-                    },
-                    responseType: "json",
-                    onload: function (response) {
-                        if (response.status == 200) {
-                            try {
-                                var result = response.response["result"];
-                                return resolve(result);
-                            }
-                            catch (e) {
-                                return resolve("");
-                            }
-                        }
-                        else {
-                            return resolve("");
+                };
+                makeOCRRequest("/api/ocr/image", datas,
+                    function(result) {
+                        // 确保结果有效
+                        if (result && (typeof result === 'string' || typeof result === 'number')) {
+                            console.log("【我的验证码识别】p1: 识别成功", result);
+                            resolve(String(result));
+                        } else {
+                            console.log("【我的验证码识别】p1: 识别结果无效", result);
+                            resolve("");
                         }
                     },
-                    onerror: function(error) {
-                        return resolve("");
+                    function(error) {
+                        console.log("【我的验证码识别】p1: 请求失败", error);
+                        resolve("");
                     }
-                });
+                );
             });
         }
         else if (captchaType == "math") {
@@ -652,33 +808,23 @@
             return new Promise((resolve) => {
                 const datas = {
                     "img_base64": String(code),
-                }
-                GM_xmlhttpRequest({
-                    method: "POST",
-                    url: baseUrl + "/api/ocr/compute",
-                    data: JSON.stringify(datas),
-                    headers: {
-                        "Content-Type": "application/json"
-                    },
-                    responseType: "json",
-                    onload: function (response) {
-                        if (response.status == 200) {
-                            try {
-                                var result = response.response["result"];
-                                return resolve(result);
-                            }
-                            catch (e) {
-                                return resolve("");
-                            }
-                        }
-                        else {
-                            return resolve("");
+                };
+                makeOCRRequest("/api/ocr/compute", datas,
+                    function(result) {
+                        // 确保结果有效（算术结果可能是数字）
+                        if (result !== null && result !== undefined && result !== "") {
+                            console.log("【我的验证码识别】p1(compute): 识别成功", result);
+                            resolve(String(result));
+                        } else {
+                            console.log("【我的验证码识别】p1(compute): 识别结果无效", result);
+                            resolve("");
                         }
                     },
-                    onerror: function(error) {
-                        return resolve("");
+                    function(error) {
+                        console.log("【我的验证码识别】p1(compute): 请求失败", error);
+                        resolve("");
                     }
-                });
+                );
             });
         }
     }
@@ -738,34 +884,61 @@
     }
 
     function writeIn1(ans, code) {
-        if (!ans) {
+        // 检查结果是否有效
+        if (!ans || (typeof ans !== 'string' && typeof ans !== 'number')) {
+            console.log("【我的验证码识别】writeIn1: 结果无效", ans);
             return;
         }
-        if (code && GM_getValue("preCode", "") !== code) {
+        // 转换为字符串并清理
+        ans = String(ans).replace(/\s+/g, "");
+        if (!ans || ans.length === 0) {
+            console.log("【我的验证码识别】writeIn1: 结果为空");
             return;
         }
+        
+        // 检查验证码是否匹配：使用 lastRequestedCode 而不是 preCode
+        // 如果 code 存在且与 lastRequestedCode 不一致，说明验证码已更新
+        if (code && lastRequestedCode && lastRequestedCode !== code) {
+            console.log("【我的验证码识别】writeIn1: 验证码已更新，跳过写入 (code:", code, "lastRequestedCode:", lastRequestedCode, ")");
+            return;
+        }
+        
         if (!input) {
+            console.log("【我的验证码识别】writeIn1: 输入框未定义");
             return;
         }
-        ans = ans.replace(/\s+/g, "");
+        
+        // 如果输入框为空，或者当前值不等于识别结果，则允许写入
+        var currentValue = "";
         if (input.tagName == "TEXTAREA") {
-            input.innerHTML = ans;
+            currentValue = (input.innerHTML || "").trim();
+        } else {
+            currentValue = (input.value || "").trim();
         }
-        else {
-            input.value = ans;
-            if (typeof (InputEvent) !== "undefined") {
+        
+        if (currentValue === "" || currentValue !== ans) {
+            console.log("【我的验证码识别】writeIn1: 写入结果", ans, "(当前值:", currentValue, ")");
+            if (input.tagName == "TEXTAREA") {
+                input.innerHTML = ans;
+            }
+            else {
                 input.value = ans;
-                input.dispatchEvent(new InputEvent('input'));
-                var eventList = ['input', 'change', 'focus', 'keypress', 'keyup', 'keydown', 'select'];
-                for (var i = 0; i < eventList.length; i++) {
-                    fire(input, eventList[i]);
+                if (typeof (InputEvent) !== "undefined") {
+                    input.value = ans;
+                    input.dispatchEvent(new InputEvent('input'));
+                    var eventList = ['input', 'change', 'focus', 'keypress', 'keyup', 'keydown', 'select'];
+                    for (var i = 0; i < eventList.length; i++) {
+                        fire(input, eventList[i]);
+                    }
+                    FireForReact(input, 'change');
+                    input.value = ans;
                 }
-                FireForReact(input, 'change');
-                input.value = ans;
+                else if (KeyboardEvent) {
+                    input.dispatchEvent(new KeyboardEvent("input"));
+                }
             }
-            else if (KeyboardEvent) {
-                input.dispatchEvent(new KeyboardEvent("input"));
-            }
+        } else {
+            console.log("【我的验证码识别】writeIn1: 输入框已有相同值，跳过写入");
         }
     }
 
@@ -915,16 +1088,27 @@
         }
     }
 
-    function topNotice(msg) {
+    function topNotice(msg, type) {
         var div = document.createElement('div');
         div.id = 'topNotice';
-        div.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 5%; z-index: 9999999999; background: rgba(117,140,148,1); display: flex; justify-content: center; align-items: center; color: #fff; font-family: "Microsoft YaHei"; text-align: center;';
-        div.innerHTML = msg;
-        div.style.fontSize = 'medium';
+        var bgColor = 'rgba(117,140,148,1)'; // 默认蓝色
+        if (type === 'error') {
+            bgColor = 'rgba(220,53,69,0.95)'; // 红色
+        } else if (type === 'success') {
+            bgColor = 'rgba(40,167,69,0.95)'; // 绿色
+        } else if (type === 'warning') {
+            bgColor = 'rgba(255,193,7,0.95)'; // 黄色
+        }
+        div.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; min-height: 50px; z-index: 9999999999; background: ' + bgColor + '; display: flex; justify-content: center; align-items: center; color: #fff; font-family: "Microsoft YaHei"; text-align: center; padding: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);';
+        div.innerHTML = '<div style="font-size: 16px; font-weight: 500;">' + msg + '</div>';
         document.body.appendChild(div);
+        var duration = type === 'error' ? 5000 : 3500; // 错误消息显示更久
         setTimeout(function () {
-            document.body.removeChild(document.getElementById('topNotice'));
-        }, 3500);
+            var notice = document.getElementById('topNotice');
+            if (notice) {
+                document.body.removeChild(notice);
+            }
+        }, duration);
     }
 
     function manageBlackList() {
