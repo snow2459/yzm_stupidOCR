@@ -14,14 +14,10 @@ WORKDIR /app
 # 仅复制 requirements，利用缓存
 COPY requirements.txt .
 
-# 安装依赖
+# 安装依赖（仅使用二进制包，避免编译依赖）
 RUN --mount=type=cache,target=/root/.cache/pip \
-    apt-get update \
-    && apt-get install -y --no-install-recommends gcc \
-    && pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    && apt-get purge -y --auto-remove gcc \
-    && rm -rf /var/lib/apt/lists/* \
-    && find /usr/local/lib/python3.9 -name "__pycache__" -type d -prune -exec rm -rf {} +
+    pip install --no-cache-dir --prefer-binary --no-compile -r requirements.txt \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # 复制代码
 COPY . .

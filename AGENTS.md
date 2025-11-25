@@ -17,8 +17,7 @@
 - 首选类型注解与显式错误处理，避免裸 `except`；保持线程池、OCR 实例为模块级单例。
 
 ## 测试指南
-- 目前无自动化测试，提交前至少做手工验证：1) 管理端登录 `POST /api/admin/login`，确认会话与 Token CRUD 正常；2) 核验 `X-Token` 保护的 OCR 路由。
-- 示例请求：`curl -X POST http://127.0.0.1:6688/api/ocr/image -H "Content-Type: application/json" -H "X-Token: <token>" -d '{"img_base64":"<base64>"}'`，确认返回结果合理。
+- 示例请求：`curl -X POST http://127.0.0.1:6688/api/ocr/image -H "Content-Type: application/json" -H "X-Token: t7h58GUy6fFHLXa3PnwWWsFpebRI5110RqVjet_nlGC" -d '{"img_base64":"<base64>"}'`，确认返回结果合理。
 - 注意图片体积不超过 `MAX_IMAGE_SIZE`，滑块接口需同时传 `gapimg_base64` 与 `fullimg_base64`。
 
 ## 提交与合并规范
