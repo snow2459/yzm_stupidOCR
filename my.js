@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         token版
+// @name         验证码自动识别脚本
 // @namespace    http://tampermonkey.net/
-// @version      0.1
+// @version      0.2
 // @author       You
 // @connect      *
 // @match        http://*/*
@@ -12,39 +12,45 @@
 // @grant        GM_registerMenuCommand
 // ==/UserScript==
 
+/**
+ * 验证码自动识别脚本
+ * 功能模块：
+ * 1. 配置管理（Token、规则、黑名单）
+ * 2. 限流管理（10秒50次）
+ * 3. OCR 请求处理
+ * 4. 验证码识别逻辑
+ * 5. DOM 监听和自动填写
+ */
+
 (function () {
     'use strict';
 
-    var element, input, imgIndex, canvasIndex, inputIndex, captchaType;
-    var localRules = [];
-    var baseUrl = "http://localhost:6688"
-    var exist = false;
-    var iscors = false;
-    var inBlack = false;
-    var firstin = true;
-    // 用于跟踪验证码图像的上次修改时间
-    var lastModified = 0;
-    // 用于跟踪DOM变化的节流定时器
-    var domChangeTimer = null;
-    var imgSrc = "";
-    var lastRequestedCode = "";
-
-    // 添加菜单
-    GM_registerMenuCommand('添加当前页面规则', addRule);
-    GM_registerMenuCommand('清除当前页面规则', delRule);
-    GM_registerMenuCommand('管理网页黑名单', manageBlackList);
-    GM_registerMenuCommand('导入规则', importRules);
-    GM_registerMenuCommand('导出规则', exportRules);
-    GM_registerMenuCommand('配置 Token', configureToken);
-
-    GM_setValue("preCode", "");
-
-    // 限流配置（10秒50次）
+    // ==================== 配置和常量 ====================
+    var baseUrl = "http://localhost:6688";
+    
+    // 限流配置
     var RATE_LIMIT_WINDOW = 10000; // 10秒
     var RATE_LIMIT_MAX_REQUESTS = 50; // 最大50次
     var requestHistory = []; // 请求历史记录
 
-    // 限流管理器
+    // ==================== 全局状态变量 ====================
+    var element, input; // 当前验证码元素和输入框
+    var imgIndex, canvasIndex, inputIndex; // 元素索引
+    var captchaType; // 验证码类型：general 或 math
+    var localRules = []; // 当前页面的规则
+    var exist = false; // 是否存在匹配的规则
+    var iscors = false; // 是否存在跨域问题
+    var inBlack = false; // 是否在黑名单中
+    var firstin = true; // 是否首次识别
+    var lastModified = 0; // 验证码图像的上次修改时间
+    var domChangeTimer = null; // DOM变化的节流定时器
+    var imgSrc = ""; // 当前验证码图片的 src
+    var lastRequestedCode = ""; // 最后一次请求的验证码 code
+
+    // 初始化
+    GM_setValue("preCode", "");
+
+    // ==================== 限流管理 ====================
     function checkRateLimit() {
         var now = Date.now();
         // 清理过期记录
@@ -67,7 +73,11 @@
         return { allowed: true };
     }
 
-    // Token 配置功能
+    // ==================== Token 管理 ====================
+    
+    /**
+     * 配置 Token
+     */
     function configureToken() {
         var currentToken = GM_getValue("ocrToken", "");
         var div = document.createElement("div");
@@ -125,6 +135,11 @@
         };
     }
 
+    // ==================== 规则管理 ====================
+    
+    /**
+     * 导入规则
+     */
     function importRules() {
         var input = document.createElement('input');
         input.type = 'file';
@@ -145,6 +160,9 @@
         }
     }
 
+    /**
+     * 导出规则
+     */
     function exportRules() {
         var rules = GM_getValue("captchaRules", []);
         var data = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(rules));
@@ -154,6 +172,57 @@
         a.click();
     }
 
+    // ==================== DOM 工具函数 ====================
+    
+    /**
+     * 将图片元素转换为 base64 字符串
+     * @param {HTMLElement} imgElement - 图片元素（img 或 canvas）
+     * @returns {string} base64 编码的图片数据
+     */
+    function imageToBase64(imgElement) {
+        try {
+            if (imgElement.tagName === "CANVAS") {
+                return imgElement.toDataURL("image/png").split("base64,")[1];
+            } else if (imgElement.tagName === "IMG") {
+                var canvas = document.createElement("canvas");
+                var ctx = canvas.getContext("2d");
+                canvas.width = imgElement.width;
+                canvas.height = imgElement.height;
+                ctx.drawImage(imgElement, 0, 0, imgElement.width, imgElement.height);
+                return canvas.toDataURL("image/png").split("base64,")[1];
+            }
+        } catch (err) {
+            console.log("【我的验证码识别】图片转换失败:", err);
+        }
+        return null;
+    }
+    
+    /**
+     * 将 Blob URL 图片转换为 base64
+     * @param {string} blobUrl - Blob URL
+     * @returns {Promise<string>} base64 编码的图片数据
+     */
+    function blobUrlToBase64(blobUrl) {
+        return new Promise(function(resolve) {
+            const image = new Image();
+            image.src = blobUrl;
+            image.onload = function() {
+                const canvas = document.createElement('canvas');
+                canvas.width = image.width;
+                canvas.height = image.height;
+                const context = canvas.getContext('2d');
+                context.drawImage(image, 0, 0, image.width, image.height);
+                resolve(canvas.toDataURL().split("base64,")[1]);
+            };
+            image.onerror = function() {
+                resolve(null);
+            };
+        });
+    }
+    
+    /**
+     * 转义 CSS 选择器值
+     */
     function escapeSelectorValue(value) {
         if (!value) return "";
         if (window.CSS && window.CSS.escape) {
@@ -162,6 +231,9 @@
         return value.replace(/([ !"#$%&'()*+,.\/:;<=>?@[\]^`{|}~])/g, '\\$1');
     }
 
+    /**
+     * 获取元素的 CSS 选择器
+     */
     function getElementSelector(target) {
         if (!target || !target.nodeType || target.nodeType !== 1) return "";
         if (target.id) {
@@ -188,6 +260,9 @@
         return segments.join(" > ");
     }
 
+    /**
+     * 检查元素是否可见
+     */
     function isElementVisible(elem) {
         if (!elem) return false;
         if (!document.body.contains(elem)) return false;
@@ -634,6 +709,13 @@
         return false;
     }
 
+    // ==================== 结果写入 ====================
+    
+    /**
+     * 将识别结果写入输入框（自动识别模式）
+     * @param {string} ans - 识别结果
+     * @param {string} code - 验证码的 base64 code
+     */
     function writeIn(ans, code) {
         // 检查结果是否有效
         if (!ans || (typeof ans !== 'string' && typeof ans !== 'number')) {
@@ -659,19 +741,7 @@
             var currentValue = (input.value || "").trim();
             if (currentValue === "" || currentValue !== ans) {
                 console.log("【我的验证码识别】writeIn: 写入结果", ans, "(当前值:", currentValue, ")");
-                input.value = ans;
-                if (typeof (InputEvent) !== "undefined") {
-                    input.value = ans;
-                    input.dispatchEvent(new InputEvent('input'));
-                    var eventList = ['input', 'change', 'focus', 'keypress', 'keyup', 'keydown', 'select'];
-                    for (var i = 0; i < eventList.length; i++) {
-                        fire(input, eventList[i]);
-                    }
-                    input.value = ans;
-                }
-                else if (KeyboardEvent) {
-                    input.dispatchEvent(new KeyboardEvent("input"));
-                }
+                triggerInputEvents(input, ans);
             } else {
                 console.log("【我的验证码识别】writeIn: 输入框已有相同值，跳过写入");
             }
@@ -680,7 +750,16 @@
         }
     }
 
-    // 通用请求函数，包含 token 和限流检查
+    // ==================== OCR 请求处理 ====================
+    
+    /**
+     * 通用 OCR 请求函数
+     * 包含 token 验证和限流检查
+     * @param {string} url - API 路径
+     * @param {object} data - 请求数据
+     * @param {function} onSuccess - 成功回调
+     * @param {function} onError - 错误回调
+     */
     function makeOCRRequest(url, data, onSuccess, onError) {
         // 检查限流
         var rateLimitCheck = checkRateLimit();
@@ -743,15 +822,27 @@
         });
     }
 
+    /**
+     * 验证识别结果是否有效
+     */
+    function isValidResult(result) {
+        if (result === null || result === undefined || result === "") {
+            return false;
+        }
+        return typeof result === 'string' || typeof result === 'number';
+    }
+
+    /**
+     * 通用 OCR 识别函数（自动识别模式）
+     * @param {string} code - 验证码的 base64 code
+     * @param {number} i - 图片索引（用于失败时尝试下一个）
+     */
     function p(code, i) {
         return new Promise((resolve) => {
-            const datas = {
-                "img_base64": String(code),
-            };
+            const datas = { "img_base64": String(code) };
             makeOCRRequest("/api/ocr/image", datas, 
                 function(result) {
-                    // 确保结果有效
-                    if (result && (typeof result === 'string' || typeof result === 'number')) {
+                    if (isValidResult(result)) {
                         console.log("【我的验证码识别】p: 识别成功", result);
                         resolve(String(result));
                     } else {
@@ -762,7 +853,6 @@
                 function(error) {
                     console.log("【我的验证码识别】p: 请求失败", error);
                     if (error === "token_invalid" || error === "no_token") {
-                        // Token 问题，不继续尝试
                         resolve("");
                     } else {
                         // 其他错误，尝试下一个
@@ -779,54 +869,34 @@
         });
     }
 
+    /**
+     * OCR 识别函数（规则模式）
+     * @param {string} code - 验证码的 base64 code
+     */
     function p1(code) {
-        if (captchaType == "general" || captchaType == null) {
-            return new Promise((resolve) => {
-                const datas = {
-                    "img_base64": String(code),
-                };
-                makeOCRRequest("/api/ocr/image", datas,
-                    function(result) {
-                        // 确保结果有效
-                        if (result && (typeof result === 'string' || typeof result === 'number')) {
-                            console.log("【我的验证码识别】p1: 识别成功", result);
-                            resolve(String(result));
-                        } else {
-                            console.log("【我的验证码识别】p1: 识别结果无效", result);
-                            resolve("");
-                        }
-                    },
-                    function(error) {
-                        console.log("【我的验证码识别】p1: 请求失败", error);
+        var apiUrl = "/api/ocr/image";
+        if (captchaType == "math") {
+            apiUrl = "/api/ocr/compute";
+        }
+        
+        return new Promise((resolve) => {
+            const datas = { "img_base64": String(code) };
+            makeOCRRequest(apiUrl, datas,
+                function(result) {
+                    if (isValidResult(result)) {
+                        console.log("【我的验证码识别】p1: 识别成功", result);
+                        resolve(String(result));
+                    } else {
+                        console.log("【我的验证码识别】p1: 识别结果无效", result);
                         resolve("");
                     }
-                );
-            });
-        }
-        else if (captchaType == "math") {
-            // 使用本地算术验证码识别，不依赖云码
-            return new Promise((resolve) => {
-                const datas = {
-                    "img_base64": String(code),
-                };
-                makeOCRRequest("/api/ocr/compute", datas,
-                    function(result) {
-                        // 确保结果有效（算术结果可能是数字）
-                        if (result !== null && result !== undefined && result !== "") {
-                            console.log("【我的验证码识别】p1(compute): 识别成功", result);
-                            resolve(String(result));
-                        } else {
-                            console.log("【我的验证码识别】p1(compute): 识别结果无效", result);
-                            resolve("");
-                        }
-                    },
-                    function(error) {
-                        console.log("【我的验证码识别】p1(compute): 请求失败", error);
-                        resolve("");
-                    }
-                );
-            });
-        }
+                },
+                function(error) {
+                    console.log("【我的验证码识别】p1: 请求失败", error);
+                    resolve("");
+                }
+            );
+        });
     }
 
     function isCORS() {
@@ -865,24 +935,55 @@
         });
     }
 
+    /**
+     * 触发 DOM 事件
+     */
     function fire(element, eventName) {
         var event = document.createEvent("HTMLEvents");
         event.initEvent(eventName, true, true);
         element.dispatchEvent(event);
     }
     
+    /**
+     * 触发 React 组件事件
+     */
     function FireForReact(element, eventName) {
         try {
             let env = new Event(eventName);
             element.dispatchEvent(env);
-            var funName = Object.keys(element).find(p => Object.keys(element[p]).find(f => f.toLowerCase().endsWith(eventName)));
+            var funName = Object.keys(element).find(p => 
+                Object.keys(element[p]).find(f => f.toLowerCase().endsWith(eventName))
+            );
             if (funName != undefined) {
-                element[funName].onChange(env)
+                element[funName].onChange(env);
             }
         }
         catch (e) { }
     }
+    
+    /**
+     * 触发输入框的所有事件（确保表单框架能捕获到变化）
+     */
+    function triggerInputEvents(inputElement, value) {
+        inputElement.value = value;
+        if (typeof (InputEvent) !== "undefined") {
+            inputElement.dispatchEvent(new InputEvent('input'));
+            var eventList = ['input', 'change', 'focus', 'keypress', 'keyup', 'keydown', 'select'];
+            for (var i = 0; i < eventList.length; i++) {
+                fire(inputElement, eventList[i]);
+            }
+            inputElement.value = value;
+        }
+        else if (KeyboardEvent) {
+            inputElement.dispatchEvent(new KeyboardEvent("input"));
+        }
+    }
 
+    /**
+     * 将识别结果写入输入框（规则模式）
+     * @param {string} ans - 识别结果
+     * @param {string} code - 验证码的 base64 code
+     */
     function writeIn1(ans, code) {
         // 检查结果是否有效
         if (!ans || (typeof ans !== 'string' && typeof ans !== 'number')) {
@@ -922,20 +1023,8 @@
                 input.innerHTML = ans;
             }
             else {
-                input.value = ans;
-                if (typeof (InputEvent) !== "undefined") {
-                    input.value = ans;
-                    input.dispatchEvent(new InputEvent('input'));
-                    var eventList = ['input', 'change', 'focus', 'keypress', 'keyup', 'keydown', 'select'];
-                    for (var i = 0; i < eventList.length; i++) {
-                        fire(input, eventList[i]);
-                    }
-                    FireForReact(input, 'change');
-                    input.value = ans;
-                }
-                else if (KeyboardEvent) {
-                    input.dispatchEvent(new KeyboardEvent("input"));
-                }
+                triggerInputEvents(input, ans);
+                FireForReact(input, 'change');
             }
         } else {
             console.log("【我的验证码识别】writeIn1: 输入框已有相同值，跳过写入");
@@ -1088,6 +1177,13 @@
         }
     }
 
+    // ==================== UI 工具函数 ====================
+    
+    /**
+     * 显示顶部通知
+     * @param {string} msg - 消息内容
+     * @param {string} type - 消息类型：success/error/warning
+     */
     function topNotice(msg, type) {
         var div = document.createElement('div');
         div.id = 'topNotice';
@@ -1170,22 +1266,44 @@
         }
     }
 
-    console.log("【我的验证码识别】正在运行...");
-
-    var url = window.location.href;
-    var blackList = GM_getValue("blackList", []);
-    var inBlack = blackList.some(function (blackItem) {
-        return url.includes(blackItem);
-    });
-    if (inBlack) {
-        console.log("【我的验证码识别】当前页面在黑名单中");
-        return;
-    } else {
-        // 页面初始化时启动识别
+    // ==================== 初始化 ====================
+    
+    /**
+     * 初始化脚本
+     */
+    function init() {
+        console.log("【我的验证码识别】正在运行...");
+        
+        // 检查黑名单
+        var url = window.location.href;
+        var blackList = GM_getValue("blackList", []);
+        inBlack = blackList.some(function (blackItem) {
+            return url.includes(blackItem);
+        });
+        
+        if (inBlack) {
+            console.log("【我的验证码识别】当前页面在黑名单中");
+            return;
+        }
+        
+        // 注册菜单
+        GM_registerMenuCommand('添加当前页面规则', addRule);
+        GM_registerMenuCommand('清除当前页面规则', delRule);
+        GM_registerMenuCommand('管理网页黑名单', manageBlackList);
+        GM_registerMenuCommand('导入规则', importRules);
+        GM_registerMenuCommand('导出规则', exportRules);
+        GM_registerMenuCommand('配置 Token', configureToken);
+        
+        // 启动识别
         start();
     }
+    
+    // 执行初始化
+    init();
 
-    // 页面加载完成后再次尝试识别验证码，确保元素已加载
+    // ==================== 事件监听 ====================
+    
+    // 页面加载完成后再次尝试识别验证码
     window.addEventListener('load', function() {
         if (!inBlack) {
             console.log("【我的验证码识别】页面加载完成，重新尝试识别");
