@@ -116,6 +116,19 @@
             background: #667eea;
             color: white;
         }
+        .btn-reset {
+            padding: 6px 12px;
+            border: 1px solid #ffc107;
+            border-radius: 4px;
+            background: #fffbea;
+            color: #d39e00;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .btn-reset:hover {
+            background: #ffc107;
+            color: #fff;
+        }
         .add-token-section {
             background: #f5f5f5;
             padding: 20px;
@@ -275,6 +288,7 @@
                     <th>Token</th>
                     <th>每分钟</th>
                     <th>每小时</th>
+                    <th>使用次数</th>
                     <th>创建时间</th>
                     <th>操作</th>
                 </tr>
@@ -344,7 +358,7 @@
         function renderTokenTable(tokens) {
             const tbody = document.getElementById('tokenTableBody');
             if (tokens.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #999;">暂无 Token</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #999;">暂无 Token</td></tr>';
                 return;
             }
             
@@ -359,10 +373,12 @@
                     </td>
                     <td>${formatLimit(token.minute_limit)}</td>
                     <td>${formatLimit(token.hour_limit)}</td>
+                    <td>${token.usage_count ?? 0}</td>
                     <td>${token.created_at ? token.created_at.substring(0, 10) : '-'}</td>
                     <td>
                         <button class="btn-edit" onclick="editToken('${token.id}')">编辑</button>
                         <button class="btn-delete" onclick="deleteToken('${token.id}')">删除</button>
+                        <button class="btn-reset" onclick="resetUsage('${token.id}')">清零</button>
                     </td>
                 </tr>
             `).join('');
@@ -512,6 +528,25 @@
                 setTimeout(() => location.reload(), 1000);
             } else {
                 showMessage('删除失败：' + (data.detail || '未知错误'), 'error');
+            }
+        }
+        
+        // 清零使用次数
+        async function resetUsage(tokenId) {
+            if (!confirm('确定清零该 Token 的使用次数吗？')) return;
+            
+            const response = await fetch(`/api/admin/token/${tokenId}/reset_usage`, {
+                method: 'POST'
+            });
+            const data = await response.json();
+            
+            if (response.ok) {
+                showMessage('使用次数已清零', 'success');
+                loadTokens();
+            } else if (response.status === 401) {
+                window.location.href = '/admin/login';
+            } else {
+                showMessage('清零失败：' + (data.detail || '未知错误'), 'error');
             }
         }
         

@@ -27,7 +27,12 @@
 
     // ==================== 配置和常量 ====================
     var baseUrl = "http://localhost:6688";
-    var RETRY_DELAY_MS = 1000; // 请求失败后的重试间隔，避免高频重试
+    var RETRY_DELAY_MS = 0; // 非 Token 异常前3次允许立即重试
+    var RETRY_LOCK_MS = 10000; // 普通异常锁定时间
+    var TOKEN_LOCK_MS = 10000; // Token 校验失败后冷却时间
+    var consecutiveFailures = 0; // 连续失败计数（非 Token）
+    var nextRetryAt = 0; // 冷却截至时间
+    var pendingRetryTimer = null; // 冷却期间的定时器
     
     // 限流配置
     var RATE_LIMIT_WINDOW = 10000; // 10秒
@@ -762,6 +767,18 @@
      * @param {function} onError - 错误回调
      */
     function makeOCRRequest(url, data, onSuccess, onError) {
+        var now = Date.now();
+        if (nextRetryAt && now < nextRetryAt) {
+            // 冷却期内，仅安排一次延迟重试，避免占用资源
+            if (!pendingRetryTimer) {
+                pendingRetryTimer = setTimeout(function() {
+                    pendingRetryTimer = null;
+                    makeOCRRequest(url, data, onSuccess, onError);
+                }, nextRetryAt - now);
+            }
+            return;
+        }
+
         // 检查限流
         var rateLimitCheck = checkRateLimit();
         if (!rateLimitCheck.allowed) {
@@ -774,7 +791,8 @@
         var token = GM_getValue("ocrToken", "");
         if (!token) {
             topNotice("未配置 Token，请通过菜单配置 Token", "error");
-            if (onError) onError("no_token");
+            scheduleLock(TOKEN_LOCK_MS, url, data, onSuccess, onError);
+            if (typeof onError === "function") onError("no_token");
             return;
         }
 
@@ -783,7 +801,31 @@
             "X-Token": token
         };
 
+        function scheduleLock(lockMs, retryUrl, retryData, successCb, errorCb) {
+            nextRetryAt = Date.now() + lockMs;
+            if (!pendingRetryTimer) {
+                pendingRetryTimer = setTimeout(function() {
+                    pendingRetryTimer = null;
+                    makeOCRRequest(retryUrl, retryData, successCb, errorCb);
+                }, lockMs);
+            }
+        }
+
         function handleErrorWithDelay(code) {
+            if (code === "token_invalid" || code === "no_token") {
+                consecutiveFailures = 0; // Token 问题单独处理
+                scheduleLock(TOKEN_LOCK_MS, url, data, onSuccess, onError);
+                if (typeof onError === "function") {
+                    setTimeout(function() { onError(code); }, RETRY_DELAY_MS);
+                }
+                return;
+            }
+
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= 3) {
+                consecutiveFailures = 0;
+                scheduleLock(RETRY_LOCK_MS, url, data, onSuccess, onError);
+            }
             if (typeof onError === "function") {
                 setTimeout(function() { onError(code); }, RETRY_DELAY_MS);
             }
@@ -797,6 +839,8 @@
             responseType: "json",
             onload: function (response) {
                 if (response.status == 200) {
+                    consecutiveFailures = 0;
+                    nextRetryAt = 0;
                     try {
                         var result = response.response["result"];
                         // 确保结果不为空且是有效字符串

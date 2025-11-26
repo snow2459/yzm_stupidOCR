@@ -157,6 +157,10 @@ token_value_map: Dict[str, Dict] = {}
 token_cache_lock = threading.Lock()
 rate_limit_state: Dict[str, Dict] = {}
 rate_limit_lock = threading.Lock()
+usage_increment_queue: Dict[str, int] = {}
+usage_queue_lock = threading.Lock()
+USAGE_FLUSH_INTERVAL = 5  # 秒
+usage_flush_thread: Optional[threading.Thread] = None
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -170,7 +174,7 @@ def load_tokens_from_db() -> List[Dict]:
     """从 SQLite 读取所有 Token"""
     conn = get_db_connection()
     cursor = conn.execute("""
-        SELECT id, token, name, created_at, updated_at, minute_limit, hour_limit
+        SELECT id, token, name, created_at, updated_at, minute_limit, hour_limit, usage_count
         FROM tokens
         ORDER BY id ASC
     """)
@@ -184,7 +188,8 @@ def load_tokens_from_db() -> List[Dict]:
             'created_at': row['created_at'] or "",
             'updated_at': row['updated_at'] or row['created_at'] or "",
             'minute_limit': row['minute_limit'],
-            'hour_limit': row['hour_limit']
+            'hour_limit': row['hour_limit'],
+            'usage_count': row['usage_count'] or 0
         }
         for row in rows
     ]
@@ -217,15 +222,10 @@ def init_db():
             created_at TEXT,
             updated_at TEXT,
             minute_limit INTEGER,
-            hour_limit INTEGER
+            hour_limit INTEGER,
+            usage_count INTEGER DEFAULT 0
         )
     """)
-    # 兼容旧表，补充限流字段
-    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(tokens)").fetchall()}
-    if 'minute_limit' not in existing_columns:
-        conn.execute("ALTER TABLE tokens ADD COLUMN minute_limit INTEGER")
-    if 'hour_limit' not in existing_columns:
-        conn.execute("ALTER TABLE tokens ADD COLUMN hour_limit INTEGER")
     conn.commit()
     conn.close()
     
@@ -309,6 +309,56 @@ def enforce_rate_limit(token_value: str, minute_limit: Optional[int], hour_limit
         rate_limit_state[token_value] = state
 
 
+def schedule_usage_increment(token_value: str):
+    """记录 Token 调用次数，先更新内存，再批量异步落库"""
+    with token_cache_lock:
+        token_data = token_value_map.get(token_value)
+        if token_data:
+            token_data['usage_count'] = (token_data.get('usage_count') or 0) + 1
+            for cached in token_cache:
+                if cached.get('token') == token_value:
+                    cached['usage_count'] = token_data['usage_count']
+                    break
+    
+    with usage_queue_lock:
+        usage_increment_queue[token_value] = usage_increment_queue.get(token_value, 0) + 1
+
+
+def usage_flush_worker():
+    """周期性将调用次数增量写入 SQLite"""
+    while True:
+        time.sleep(USAGE_FLUSH_INTERVAL)
+        with usage_queue_lock:
+            pending_updates = usage_increment_queue.copy()
+            usage_increment_queue.clear()
+        
+        if not pending_updates:
+            continue
+        
+        conn = get_db_connection()
+        for token_value, inc in pending_updates.items():
+            conn.execute(
+                """
+                UPDATE tokens
+                SET usage_count = COALESCE(usage_count, 0) + ?
+                WHERE token = ?
+                """,
+                (inc, token_value)
+            )
+        conn.commit()
+        conn.close()
+        refresh_token_cache()
+
+
+def start_usage_flush_worker():
+    """启动后台线程，用于异步持久化调用次数"""
+    global usage_flush_thread
+    if usage_flush_thread and usage_flush_thread.is_alive():
+        return
+    usage_flush_thread = threading.Thread(target=usage_flush_worker, daemon=True)
+    usage_flush_thread.start()
+
+
 def add_token_record(token_value: str, name: str, minute_limit: Optional[int] = None, hour_limit: Optional[int] = None) -> Dict:
     """新增 Token 记录"""
     now = datetime.now().isoformat()
@@ -329,7 +379,8 @@ def add_token_record(token_value: str, name: str, minute_limit: Optional[int] = 
         'token': token_value,
         'name': name,
         'created_at': now,
-        'updated_at': now
+        'updated_at': now,
+        'usage_count': 0
     }
 
 
@@ -375,6 +426,25 @@ def delete_token_record(token_id: str) -> bool:
     return False
 
 
+def reset_token_usage_count(token_id: str) -> bool:
+    """将指定 Token 的使用次数清零"""
+    token_data = get_token_by_id(token_id)
+    if not token_data:
+        return False
+    
+    with usage_queue_lock:
+        usage_increment_queue.pop(token_data.get('token'), None)
+    
+    conn = get_db_connection()
+    cursor = conn.execute("UPDATE tokens SET usage_count = 0 WHERE id = ?", (token_id,))
+    conn.commit()
+    conn.close()
+    if cursor.rowcount > 0:
+        refresh_token_cache()
+        return True
+    return False
+
+
 async def verify_token(x_token: Optional[str] = Header(None, alias="X-Token")):
     """验证 token 的依赖函数"""
     if not x_token:
@@ -397,11 +467,14 @@ async def verify_token(x_token: Optional[str] = Header(None, alias="X-Token")):
         token_config.get('hour_limit')
     )
     
+    schedule_usage_increment(x_token)
+    
     return x_token
 
 
 # 初始化数据库与缓存
 init_db()
+start_usage_flush_worker()
 
 # ==================== 数据模型 ====================
 
@@ -727,6 +800,7 @@ async def admin_page(request: Request):
             created_at = token.get('created_at', '')
             minute_limit = format_limit(token.get('minute_limit'))
             hour_limit = format_limit(token.get('hour_limit'))
+            usage_count = token.get('usage_count', 0)
             token_list_html += f"""
             <tr>
                 <td>{token_name}</td>
@@ -738,15 +812,17 @@ async def admin_page(request: Request):
                 </td>
                 <td>{minute_limit}</td>
                 <td>{hour_limit}</td>
+                <td>{usage_count}</td>
                 <td>{created_at[:10] if created_at else '-'}</td>
                 <td>
                     <button class="btn-edit" onclick="editToken('{token_id}')">编辑</button>
                     <button class="btn-delete" onclick="deleteToken('{token_id}')">删除</button>
+                    <button class="btn-reset" onclick="resetUsage('{token_id}')">清零次数</button>
                 </td>
             </tr>
             """
     else:
-        token_list_html = '<tr><td colspan="6" style="text-align: center; color: #999;">暂无 Token</td></tr>'
+        token_list_html = '<tr><td colspan="7" style="text-align: center; color: #999;">暂无 Token</td></tr>'
     
     # 读取模板文件
     template_path = os.path.join(os.path.dirname(__file__), "admin_template.html")
@@ -859,6 +935,21 @@ async def delete_token(token_id: str, request: Request):
         raise HTTPException(status_code=500, detail="删除 Token 失败")
 
 
+@app.post("/api/admin/token/{token_id}/reset_usage")
+async def reset_token_usage(token_id: str, request: Request):
+    """清零指定 Token 的使用次数"""
+    session_id = request.cookies.get("admin_session")
+    if not verify_session(session_id):
+        raise HTTPException(status_code=401, detail="未授权")
+    
+    if not get_token_by_id(token_id):
+        raise HTTPException(status_code=404, detail="Token 不存在")
+    
+    if reset_token_usage_count(token_id):
+        return {"success": True, "message": "使用次数已清零"}
+    raise HTTPException(status_code=500, detail="清零失败")
+
+
 @app.get("/api/admin/tokens")
 async def get_tokens(request: Request):
     """获取所有 Token（不返回完整 token 值）"""
@@ -870,6 +961,7 @@ async def get_tokens(request: Request):
     safe_tokens = []
     for token in tokens:
         safe_token = token.copy()
+        safe_token['usage_count'] = safe_token.get('usage_count', 0)
         if 'token' in safe_token:
             safe_token['token'] = safe_token['token'][:20] + '...'
         safe_tokens.append(safe_token)
