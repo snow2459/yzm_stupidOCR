@@ -12,6 +12,8 @@ import secrets
 import sqlite3
 import threading
 import time
+import hashlib
+import hmac
 from io import BytesIO
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, status
@@ -65,6 +67,9 @@ app.add_middleware(
 
 # 会话管理
 admin_sessions = set()
+login_nonces: Dict[str, float] = {}
+login_nonces_lock = threading.Lock()
+LOGIN_NONCE_TTL_SECONDS = 60
 
 # ==================== OCR 模型初始化 ====================
 ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
@@ -249,7 +254,39 @@ def generate_token() -> str:
 
 def verify_admin_credentials(username: str, password: str) -> bool:
     """验证管理员凭证"""
-    return username == ADMIN_USERNAME and password == ADMIN_PASSWORD
+    return hmac.compare_digest(str(username), str(ADMIN_USERNAME)) and hmac.compare_digest(str(password), str(ADMIN_PASSWORD))
+
+
+def compute_admin_login_sig(username: str, password: str, nonce: str) -> str:
+    """
+    基于一次性 nonce 的登录签名（避免明文传输密码）
+    注意：这不是 HTTPS 的替代品，仅降低被动窃听风险。
+    """
+    raw = f"{username}:{password}:{nonce}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def prune_login_nonces(now: float):
+    expired = [k for k, exp in login_nonces.items() if exp < now]
+    for k in expired:
+        login_nonces.pop(k, None)
+
+
+def issue_login_nonce() -> str:
+    nonce = secrets.token_urlsafe(24)
+    now = time.time()
+    with login_nonces_lock:
+        prune_login_nonces(now)
+        login_nonces[nonce] = now + LOGIN_NONCE_TTL_SECONDS
+    return nonce
+
+
+def consume_login_nonce(nonce: str) -> bool:
+    now = time.time()
+    with login_nonces_lock:
+        prune_login_nonces(now)
+        exp = login_nonces.pop(nonce, None)
+    return exp is not None and exp >= now
 
 
 def create_session() -> str:
@@ -512,7 +549,9 @@ class ModelSliderImageIn(BaseModel):
 class LoginModel(BaseModel):
     """登录模型"""
     username: str
-    password: str
+    password: Optional[str] = None
+    nonce: Optional[str] = None
+    password_sig: Optional[str] = None
 
 
 class TokenConfigModel(BaseModel):
@@ -748,14 +787,120 @@ async def admin_login_page():
             <div id="message" class="message"></div>
         </div>
         <script>
+            async function sha256Hex(input) {
+                function sha256HexFallback(ascii) {
+                    function rightRotate(value, amount) {
+                        return (value >>> amount) | (value << (32 - amount));
+                    }
+
+                    var mathPow = Math.pow;
+                    var maxWord = mathPow(2, 32);
+                    var lengthProperty = 'length';
+                    var i, j;
+                    var result = '';
+
+                    var words = [];
+                    var asciiBitLength = ascii[lengthProperty] * 8;
+
+                    var hash = sha256HexFallback.h = sha256HexFallback.h || [];
+                    var k = sha256HexFallback.k = sha256HexFallback.k || [];
+                    var primeCounter = k[lengthProperty];
+
+                    var isComposite = {};
+                    for (var candidate = 2; primeCounter < 64; candidate++) {
+                        if (!isComposite[candidate]) {
+                            for (i = 0; i < 313; i += candidate) {
+                                isComposite[i] = candidate;
+                            }
+                            hash[primeCounter] = (mathPow(candidate, .5) * maxWord) | 0;
+                            k[primeCounter++] = (mathPow(candidate, 1 / 3) * maxWord) | 0;
+                        }
+                    }
+
+                    ascii += '\x80';
+                    while (ascii[lengthProperty] % 64 - 56) ascii += '\x00';
+                    for (i = 0; i < ascii[lengthProperty]; i++) {
+                        j = ascii.charCodeAt(i);
+                        words[i >> 2] |= j << ((3 - i) % 4) * 8;
+                    }
+                    words[words[lengthProperty]] = ((asciiBitLength / maxWord) | 0);
+                    words[words[lengthProperty]] = (asciiBitLength);
+
+                    for (j = 0; j < words[lengthProperty];) {
+                        var w = words.slice(j, j += 16);
+                        var oldHash = hash.slice(0);
+
+                        for (i = 0; i < 64; i++) {
+                            var w15 = w[i - 15], w2 = w[i - 2];
+
+                            var a = hash[0], e = hash[4];
+                            var temp1 = hash[7]
+                                + (rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25))
+                                + ((e & hash[5]) ^ ((~e) & hash[6]))
+                                + k[i]
+                                + (w[i] = (i < 16) ? w[i] : (
+                                    w[i - 16]
+                                    + (rightRotate(w15, 7) ^ rightRotate(w15, 18) ^ (w15 >>> 3))
+                                    + w[i - 7]
+                                    + (rightRotate(w2, 17) ^ rightRotate(w2, 19) ^ (w2 >>> 10))
+                                ) | 0);
+
+                            var temp2 = (rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22))
+                                + ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+
+                            hash = [(temp1 + temp2) | 0].concat(hash);
+                            hash[4] = (hash[4] + temp1) | 0;
+                            hash.pop();
+                        }
+
+                        for (i = 0; i < 8; i++) {
+                            hash[i] = (hash[i] + oldHash[i]) | 0;
+                        }
+                    }
+
+                    for (i = 0; i < 8; i++) {
+                        for (j = 3; j + 1; j--) {
+                            var b = (hash[i] >> (j * 8)) & 255;
+                            result += ((b < 16) ? 0 : '') + b.toString(16);
+                        }
+                    }
+                    return result;
+                }
+
+                // 优先使用 WebCrypto（localhost/HTTPS 环境）；非安全上下文退回纯 JS 实现
+                if (window.crypto && crypto.subtle && typeof TextEncoder !== 'undefined') {
+                    const bytes = new TextEncoder().encode(input);
+                    const digest = await crypto.subtle.digest('SHA-256', bytes);
+                    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+                }
+                const utf8 = unescape(encodeURIComponent(input));
+                return sha256HexFallback(utf8);
+            }
+
             document.getElementById('loginForm').addEventListener('submit', async function(e) {
                 e.preventDefault();
                 const username = document.getElementById('username').value;
                 const password = document.getElementById('password').value;
+                let body = { username: username, password: password };
+
+                try {
+                    const nonceResp = await fetch('/api/admin/login_nonce', { cache: 'no-store' });
+                    if (nonceResp.ok) {
+                        const nonceData = await nonceResp.json();
+                        const nonce = nonceData.nonce;
+                        const passwordSig = await sha256Hex(`${username}:${password}:${nonce}`);
+                        body = { username: username, nonce: nonce, password_sig: passwordSig };
+                    }
+                } catch (err) {
+                    // 兼容不支持 WebCrypto 的环境：退回明文（建议部署侧配合内网/反代/HTTPS）
+                    body = { username: username, password: password };
+                }
+
                 const response = await fetch('/api/admin/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username: username, password: password })
+                    cache: 'no-store',
+                    body: JSON.stringify(body)
                 });
                 const data = await response.json();
                 if (response.ok) {
@@ -844,13 +989,45 @@ async def admin_page(request: Request):
 
 # ==================== 管理 API 路由 ====================
 
+@app.get("/api/admin/login_nonce")
+async def admin_login_nonce():
+    """获取一次性登录 nonce（用于避免明文传输密码）"""
+    nonce = issue_login_nonce()
+    return JSONResponse({"nonce": nonce, "ttl": LOGIN_NONCE_TTL_SECONDS}, headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/admin/login")
-async def admin_login(login_data: LoginModel):
+async def admin_login(login_data: LoginModel, request: Request):
     """管理员登录"""
-    if verify_admin_credentials(login_data.username, login_data.password):
+    username = (login_data.username or "").strip()
+    password = (login_data.password or "").strip() if login_data.password is not None else None
+    nonce = (login_data.nonce or "").strip() if login_data.nonce is not None else None
+    password_sig = (login_data.password_sig or "").strip() if login_data.password_sig is not None else None
+
+    authenticated = False
+
+    if nonce and password_sig:
+        if consume_login_nonce(nonce):
+            expected = compute_admin_login_sig(username, ADMIN_PASSWORD, nonce)
+            authenticated = hmac.compare_digest(str(username), str(ADMIN_USERNAME)) and hmac.compare_digest(password_sig, expected)
+        else:
+            raise HTTPException(status_code=401, detail="登录凭证过期，请刷新重试")
+    elif password is not None:
+        authenticated = verify_admin_credentials(username, password)
+    else:
+        raise HTTPException(status_code=400, detail="请求参数错误")
+
+    if authenticated:
         session_id = create_session()
         response = JSONResponse({"success": True, "session_id": session_id})
-        response.set_cookie(key="admin_session", value=session_id, httponly=True, max_age=3600*24)
+        response.set_cookie(
+            key="admin_session",
+            value=session_id,
+            httponly=True,
+            samesite="strict",
+            secure=(request.url.scheme == "https"),
+            max_age=3600 * 24
+        )
         return response
     else:
         raise HTTPException(status_code=401, detail="账号或密码错误")

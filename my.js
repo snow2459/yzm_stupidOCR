@@ -33,11 +33,12 @@
     var consecutiveFailures = 0; // 连续失败计数（非 Token）
     var nextRetryAt = 0; // 冷却截至时间
     var pendingRetryTimer = null; // 冷却期间的定时器
-    
+
     // 限流配置
     var RATE_LIMIT_WINDOW = 10000; // 10秒
     var RATE_LIMIT_MAX_REQUESTS = 50; // 最大50次
     var requestHistory = []; // 请求历史记录
+    var TOKEN_NOTICE_INTERVAL_MS = 15000; // Token 提示最小间隔，避免刷屏与频繁重试
 
     // ==================== 全局状态变量 ====================
     var element, input; // 当前验证码元素和输入框
@@ -52,6 +53,9 @@
     var domChangeTimer = null; // DOM变化的节流定时器
     var imgSrc = ""; // 当前验证码图片的 src
     var lastRequestedCode = ""; // 最后一次请求的验证码 code
+    var tokenBlockReason = null; // "missing" | "invalid" | null
+    var blockedTokenValue = ""; // 被判定无效的 token
+    var lastTokenNoticeAt = 0; // 上次 Token 提示时间
 
     // 初始化
     GM_setValue("preCode", "");
@@ -60,10 +64,10 @@
     function checkRateLimit() {
         var now = Date.now();
         // 清理过期记录
-        requestHistory = requestHistory.filter(function(timestamp) {
+        requestHistory = requestHistory.filter(function (timestamp) {
             return now - timestamp < RATE_LIMIT_WINDOW;
         });
-        
+
         // 检查是否超过限制
         if (requestHistory.length >= RATE_LIMIT_MAX_REQUESTS) {
             var oldestRequest = requestHistory[0];
@@ -73,14 +77,14 @@
                 waitTime: Math.ceil(waitTime / 1000) // 转换为秒
             };
         }
-        
+
         // 记录本次请求
         requestHistory.push(now);
         return { allowed: true };
     }
 
     // ==================== Token 管理 ====================
-    
+
     /**
      * 配置 Token
      */
@@ -106,14 +110,14 @@
 
         // 如果已有 token，点击输入框显示真实值
         if (currentToken) {
-            tokenInput.addEventListener('focus', function() {
+            tokenInput.addEventListener('focus', function () {
                 if (this.value === '••••••••') {
                     this.value = currentToken;
                 }
             });
         }
 
-        saveBtn.onclick = function() {
+        saveBtn.onclick = function () {
             var token = tokenInput.value.trim();
             if (!token) {
                 topNotice("Token 不能为空", "error");
@@ -121,28 +125,87 @@
             }
             GM_setValue("ocrToken", token);
             topNotice("Token 保存成功", "success");
-            setTimeout(function() {
+            setTimeout(function () {
                 div.remove();
             }, 1000);
         };
 
-        clearBtn.onclick = function() {
+        clearBtn.onclick = function () {
             if (confirm("确定要清除 Token 吗？")) {
                 GM_setValue("ocrToken", "");
                 topNotice("Token 已清除", "success");
-                setTimeout(function() {
+                setTimeout(function () {
                     div.remove();
                 }, 1000);
             }
         };
 
-        closeBtn.onclick = function() {
+        closeBtn.onclick = function () {
             div.remove();
         };
     }
 
     // ==================== 规则管理 ====================
-    
+
+    /**
+     * 规则 URL 归一化（用于稳定匹配同一页面）
+     * - 去除 query
+     * - 兼容 hash 路由（#/ 或 #!/ 开头才纳入匹配）
+     * - 去除末尾 /
+     */
+    function normalizeUrlForRule(rawUrl) {
+        if (!rawUrl) return "";
+        try {
+            var u = new URL(String(rawUrl), window.location.href);
+            var base = u.origin + u.pathname;
+            if (base.length > 1 && base.endsWith("/")) {
+                base = base.slice(0, -1);
+            }
+
+            var hash = u.hash || "";
+            if (hash.startsWith("#/") || hash.startsWith("#!/")) {
+                hash = hash.split("?")[0];
+                if (hash.length > 2 && hash.endsWith("/")) {
+                    hash = hash.slice(0, -1);
+                }
+                return base + hash;
+            }
+            return base;
+        } catch (e) {
+            var noHash = String(rawUrl).split("#")[0];
+            var noQuery = noHash.split("?")[0];
+            if (noQuery.length > 1 && noQuery.endsWith("/")) {
+                noQuery = noQuery.slice(0, -1);
+            }
+            return noQuery;
+        }
+    }
+
+    function getCurrentPageRuleUrl() {
+        return normalizeUrlForRule(window.location.href);
+    }
+
+    /**
+     * 仅保留两种验证码类型：普通/算术
+     */
+    function normalizeCaptchaType(value) {
+        var v = String(value || "").trim().toLowerCase();
+        if (v === "math" || v === "compute" || v === "arith" || v === "arithmetic") return "math";
+        return "general";
+    }
+
+    function getApiUrlByCaptchaType(type) {
+        return normalizeCaptchaType(type) === "math" ? "/api/ocr/compute" : "/api/ocr/image";
+    }
+
+    function maybeNoticeToken(msg) {
+        var now = Date.now();
+        if (!lastTokenNoticeAt || now - lastTokenNoticeAt >= TOKEN_NOTICE_INTERVAL_MS) {
+            lastTokenNoticeAt = now;
+            topNotice(msg, "error");
+        }
+    }
+
     /**
      * 导入规则
      */
@@ -179,7 +242,7 @@
     }
 
     // ==================== DOM 工具函数 ====================
-    
+
     /**
      * 将图片元素转换为 base64 字符串
      * @param {HTMLElement} imgElement - 图片元素（img 或 canvas）
@@ -202,17 +265,17 @@
         }
         return null;
     }
-    
+
     /**
      * 将 Blob URL 图片转换为 base64
      * @param {string} blobUrl - Blob URL
      * @returns {Promise<string>} base64 编码的图片数据
      */
     function blobUrlToBase64(blobUrl) {
-        return new Promise(function(resolve) {
+        return new Promise(function (resolve) {
             const image = new Image();
             image.src = blobUrl;
-            image.onload = function() {
+            image.onload = function () {
                 const canvas = document.createElement('canvas');
                 canvas.width = image.width;
                 canvas.height = image.height;
@@ -220,12 +283,12 @@
                 context.drawImage(image, 0, 0, image.width, image.height);
                 resolve(canvas.toDataURL().split("base64,")[1]);
             };
-            image.onerror = function() {
+            image.onerror = function () {
                 resolve(null);
             };
         });
     }
-    
+
     /**
      * 转义 CSS 选择器值
      */
@@ -374,8 +437,79 @@
         return false;
     }
 
+    /**
+     * 判断输入框是否适合自动填充（避免误选 hidden 等不可见/不可写元素）
+     */
+    function isFillableInputElement(elem) {
+        if (!elem) return false;
+        if (!isElementVisible(elem)) return false;
+        if (elem.disabled || elem.readOnly) return false;
+
+        if (elem.tagName === "TEXTAREA") return true;
+        if (elem.tagName !== "INPUT") return false;
+
+        var t = (elem.getAttribute("type") || elem.type || "text").toLowerCase();
+        if (t === "hidden" || t === "button" || t === "submit" || t === "reset" || t === "image" || t === "file" || t === "checkbox" || t === "radio") {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 显示验证码类型选择弹窗
+     */
+    function showCaptchaTypeSelector(callback) {
+        var existing = document.getElementById("captchaTypeSelector");
+        if (existing) {
+            existing.remove();
+        }
+
+        var div = document.createElement("div");
+        div.id = "captchaTypeSelector";
+        div.style.cssText = 'width: 300px; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background-color: white; border: 2px solid #667eea; z-index: 9999999999; text-align: center; padding: 20px; box-shadow: 0px 0px 20px 0px rgba(0,0,0,0.5); border-radius: 10px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;';
+
+        var html = '<h3 style="margin-bottom: 15px; color: #333; font-size: 16px;">选择验证码类型</h3>' +
+            '<div style="text-align: left; padding: 0 20px; margin-bottom: 20px;">' +
+            '<div style="margin-bottom: 10px;"><label style="cursor: pointer;"><input type="radio" name="captchaType" value="general" checked> 普通验证码</label></div>' +
+            '<div style="margin-bottom: 10px;"><label style="cursor: pointer;"><input type="radio" name="captchaType" value="math"> 算数验证码</label></div>' +
+            '</div>' +
+            '<div style="display: flex; gap: 10px; padding: 0 10px;">' +
+            '<button id="saveType" style="flex: 1; padding: 8px; background: #667eea; color: white; border: none; border-radius: 4px; cursor: pointer;">确定</button>' +
+            '<button id="cancelType" style="flex: 1; padding: 8px; background: #6c757d; color: white; border: none; border-radius: 4px; cursor: pointer;">取消</button>' +
+            '</div>';
+
+        div.innerHTML = html;
+        document.body.appendChild(div);
+
+        document.getElementById('saveType').onclick = function () {
+            var radios = document.getElementsByName('captchaType');
+            var selected = "general";
+            for (var i = 0; i < radios.length; i++) {
+                if (radios[i].checked) {
+                    selected = radios[i].value;
+                    break;
+                }
+            }
+            div.remove();
+            callback(normalizeCaptchaType(selected));
+        };
+
+        document.getElementById('cancelType').onclick = function () {
+            div.remove();
+            topNotice("已取消添加规则", "warning");
+        };
+    }
+
     function addRule() {
-        var ruleData = { "url": window.location.href.split("?")[0], "img": "", "imgSelector": "", "input": "", "inputSelector": "", "inputType": "", "type": "", "captchaType": "" };
+        var ruleData = { "url": getCurrentPageRuleUrl(), "img": "", "imgSelector": "", "input": "", "inputSelector": "", "inputType": "", "type": "", "captchaType": "general" };
+        var prevOnContextMenu = document.oncontextmenu;
+        var prevOnClick = document.onclick;
+
+        function restoreDocumentHandlers() {
+            document.oncontextmenu = prevOnContextMenu || null;
+            document.onclick = prevOnClick || null;
+        }
+
         topNotice("请在验证码图片上点击鼠标 “右”👉 键");
         document.oncontextmenu = function (e) {
             e = e || window.event;
@@ -438,28 +572,28 @@
                 }
                 ruleData.inputSelector = getElementSelector(e.target);
                 ruleData.input = k;
-                var r = confirm("选择验证码类型\n\n数/英验证码请点击“确定”，算术验证码请点击“取消”");
-                if (r == true) {
-                    ruleData.captchaType = "general";
-                }
-                else {
-                    ruleData.captchaType = "math";
-                }
-                let rules = GM_getValue("captchaRules", []);
-                rules.push(ruleData);
-                GM_setValue("captchaRules", rules);
-                topNotice("添加规则成功");
-                setTimeout(function () {
-                    window.location.reload();
-                }, 1000);
+                // 重要：恢复全局事件，避免弹窗无法点击、阴影叠加
+                restoreDocumentHandlers();
+                showCaptchaTypeSelector(function (selectedType) {
+                    ruleData.captchaType = normalizeCaptchaType(selectedType);
+                    let rules = GM_getValue("captchaRules", []);
+                    rules.push(ruleData);
+                    GM_setValue("captchaRules", rules);
+                    topNotice("添加规则成功");
+                    setTimeout(function () {
+                        window.location.reload();
+                    }, 1000);
+                });
             }
         }
     }
 
     function delRule() {
-        var ruleData = { "url": window.location.href.split("?")[0] }
+        var ruleData = { "url": getCurrentPageRuleUrl() }
         let rules = GM_getValue("captchaRules", []);
-        rules = rules.filter(rule => rule.url !== ruleData.url);
+        rules = rules.filter(function (rule) {
+            return normalizeUrlForRule(rule.url) !== ruleData.url;
+        });
         GM_setValue("captchaRules", rules);
         topNotice("删除规则成功");
     }
@@ -476,10 +610,9 @@
                     GM_setValue("preCode", code);
                     lastRequestedCode = code;
                     p1(code).then((ans) => {
-                        if (ans != "")
+                        if (ans != "") {
                             writeIn1(ans, code);
-                        else
-                            codeByRule();
+                        }
                     });
                 }
             }
@@ -498,10 +631,9 @@
                         GM_setValue("preCode", code);
                         lastRequestedCode = code;
                         p1(code).then((ans) => {
-                        if (ans != "")
-                            writeIn1(ans, code);
-                        else
-                            codeByRule();
+                            if (ans != "") {
+                                writeIn1(ans, code);
+                            }
                         });
                     }
                 }
@@ -521,10 +653,9 @@
                             GM_setValue("preCode", code);
                             lastRequestedCode = code;
                             p1(code).then((ans) => {
-                                if (ans != "")
+                                if (ans != "") {
                                     writeIn1(ans, code);
-                                else
-                                    codeByRule();
+                                }
                             });
                         }
                     }
@@ -705,18 +836,20 @@
     }
 
     function findInput() {
-        var inputList = document.getElementsByTagName('input');
+        var inputList = document.querySelectorAll('input, textarea');
         for (var i = 0; i < inputList.length; i++) {
-            input = inputList[i];
-            if (isInput()) {
-                return true;
+            var candidate = inputList[i];
+            if (!isFillableInputElement(candidate)) {
+                continue;
             }
+            input = candidate;
+            if (isInput()) return true;
         }
         return false;
     }
 
     // ==================== 结果写入 ====================
-    
+
     /**
      * 将识别结果写入输入框（自动识别模式）
      * @param {string} ans - 识别结果
@@ -734,14 +867,14 @@
             console.log("【我的验证码识别】writeIn: 结果为空");
             return;
         }
-        
+
         // 检查验证码是否匹配：使用 lastRequestedCode 而不是 preCode
         // 如果 code 存在且与 lastRequestedCode 不一致，说明验证码已更新
         if (code && lastRequestedCode && lastRequestedCode !== code) {
             console.log("【我的验证码识别】writeIn: 验证码已更新，跳过写入 (code:", code, "lastRequestedCode:", lastRequestedCode, ")");
             return;
         }
-        
+
         if (findInput()) {
             // 如果输入框为空，或者当前值不等于识别结果，则允许写入
             var currentValue = (input.value || "").trim();
@@ -757,7 +890,7 @@
     }
 
     // ==================== OCR 请求处理 ====================
-    
+
     /**
      * 通用 OCR 请求函数
      * 包含 token 验证和限流检查
@@ -768,10 +901,38 @@
      */
     function makeOCRRequest(url, data, onSuccess, onError) {
         var now = Date.now();
+
+        // 获取 token
+        var token = (GM_getValue("ocrToken", "") || "").trim();
+        if (tokenBlockReason === "invalid" && token && token === blockedTokenValue) {
+            maybeNoticeToken("Token 验证失败，请通过菜单重新配置 Token");
+            if (typeof onError === "function") onError("token_invalid");
+            return;
+        }
+        if (!token) {
+            tokenBlockReason = "missing";
+            blockedTokenValue = "";
+            // Token 缺失时不进行任何自动重试，避免后台压力与“挂起”
+            nextRetryAt = 0;
+            if (pendingRetryTimer) {
+                clearTimeout(pendingRetryTimer);
+                pendingRetryTimer = null;
+            }
+            maybeNoticeToken("未配置 Token，请通过菜单配置 Token");
+            if (typeof onError === "function") onError("no_token");
+            return;
+        }
+
+        // token 有变化时，解除阻断
+        if (tokenBlockReason && token !== blockedTokenValue) {
+            tokenBlockReason = null;
+            blockedTokenValue = "";
+        }
+
         if (nextRetryAt && now < nextRetryAt) {
             // 冷却期内，仅安排一次延迟重试，避免占用资源
             if (!pendingRetryTimer) {
-                pendingRetryTimer = setTimeout(function() {
+                pendingRetryTimer = setTimeout(function () {
                     pendingRetryTimer = null;
                     makeOCRRequest(url, data, onSuccess, onError);
                 }, nextRetryAt - now);
@@ -779,20 +940,11 @@
             return;
         }
 
-        // 检查限流
+        // 检查限流（放在 token 校验之后，避免无 token 的空转也计入限流）
         var rateLimitCheck = checkRateLimit();
         if (!rateLimitCheck.allowed) {
             topNotice("请求过于频繁，请等待 " + rateLimitCheck.waitTime + " 秒后再试", "warning");
             if (onError) onError("rate_limit");
-            return;
-        }
-
-        // 获取 token
-        var token = GM_getValue("ocrToken", "");
-        if (!token) {
-            topNotice("未配置 Token，请通过菜单配置 Token", "error");
-            scheduleLock(TOKEN_LOCK_MS, url, data, onSuccess, onError);
-            if (typeof onError === "function") onError("no_token");
             return;
         }
 
@@ -804,7 +956,7 @@
         function scheduleLock(lockMs, retryUrl, retryData, successCb, errorCb) {
             nextRetryAt = Date.now() + lockMs;
             if (!pendingRetryTimer) {
-                pendingRetryTimer = setTimeout(function() {
+                pendingRetryTimer = setTimeout(function () {
                     pendingRetryTimer = null;
                     makeOCRRequest(retryUrl, retryData, successCb, errorCb);
                 }, lockMs);
@@ -812,22 +964,13 @@
         }
 
         function handleErrorWithDelay(code) {
-            if (code === "token_invalid" || code === "no_token") {
-                consecutiveFailures = 0; // Token 问题单独处理
-                scheduleLock(TOKEN_LOCK_MS, url, data, onSuccess, onError);
-                if (typeof onError === "function") {
-                    setTimeout(function() { onError(code); }, RETRY_DELAY_MS);
-                }
-                return;
-            }
-
             consecutiveFailures += 1;
             if (consecutiveFailures >= 3) {
                 consecutiveFailures = 0;
                 scheduleLock(RETRY_LOCK_MS, url, data, onSuccess, onError);
             }
             if (typeof onError === "function") {
-                setTimeout(function() { onError(code); }, RETRY_DELAY_MS);
+                setTimeout(function () { onError(code); }, RETRY_DELAY_MS);
             }
         }
 
@@ -842,31 +985,37 @@
                     consecutiveFailures = 0;
                     nextRetryAt = 0;
                     try {
-                        var result = response.response["result"];
-                        // 确保结果不为空且是有效字符串
-                        if (result && typeof result === 'string' && result.trim().length > 0) {
-                            if (onSuccess) onSuccess(result);
+                        var result = response.response ? response.response["result"] : undefined;
+                        if (isValidResult(result)) {
+                            if (onSuccess) onSuccess(String(result));
                         } else {
                             console.log("【我的验证码识别】识别结果为空或无效:", result);
                             handleErrorWithDelay("empty_result");
                         }
-                    }
-                    catch (e) {
+                    } catch (e) {
                         console.log("【我的验证码识别】解析响应失败:", e);
                         handleErrorWithDelay("parse_error");
                     }
                 }
                 else if (response.status == 403) {
                     // Token 验证失败
-                    topNotice("Token 验证失败，请检查 Token 配置", "error");
-                    handleErrorWithDelay("token_invalid");
+                    tokenBlockReason = "invalid";
+                    blockedTokenValue = token;
+                    // Token 无效时不进行自动重试，等待用户重新配置
+                    nextRetryAt = 0;
+                    if (pendingRetryTimer) {
+                        clearTimeout(pendingRetryTimer);
+                        pendingRetryTimer = null;
+                    }
+                    maybeNoticeToken("Token 验证失败，请通过菜单重新配置 Token");
+                    if (typeof onError === "function") onError("token_invalid");
                 }
                 else {
                     console.log("【我的验证码识别】请求失败，状态码:", response.status);
                     handleErrorWithDelay("request_failed");
                 }
             },
-            onerror: function(error) {
+            onerror: function (error) {
                 topNotice("请求失败，请检查服务是否正常运行", "error");
                 handleErrorWithDelay("network_error");
             }
@@ -877,10 +1026,15 @@
      * 验证识别结果是否有效
      */
     function isValidResult(result) {
-        if (result === null || result === undefined || result === "") {
-            return false;
+        if (result === null || result === undefined) return false;
+        if (typeof result === 'number') return Number.isFinite(result);
+        if (typeof result === 'string') {
+            var trimmed = result.trim();
+            if (!trimmed) return false;
+            if (trimmed.startsWith("Error:")) return false;
+            return true;
         }
-        return typeof result === 'string' || typeof result === 'number';
+        return false;
     }
 
     /**
@@ -891,8 +1045,8 @@
     function p(code, i) {
         return new Promise((resolve) => {
             const datas = { "img_base64": String(code) };
-            makeOCRRequest("/api/ocr/image", datas, 
-                function(result) {
+            makeOCRRequest("/api/ocr/image", datas,
+                function (result) {
                     if (isValidResult(result)) {
                         console.log("【我的验证码识别】p: 识别成功", result);
                         resolve(String(result));
@@ -901,7 +1055,7 @@
                         resolve("");
                     }
                 },
-                function(error) {
+                function (error) {
                     console.log("【我的验证码识别】p: 请求失败", error);
                     if (error === "token_invalid" || error === "no_token") {
                         resolve("");
@@ -925,15 +1079,12 @@
      * @param {string} code - 验证码的 base64 code
      */
     function p1(code) {
-        var apiUrl = "/api/ocr/image";
-        if (captchaType == "math") {
-            apiUrl = "/api/ocr/compute";
-        }
-        
+        var apiUrl = getApiUrlByCaptchaType(captchaType);
+
         return new Promise((resolve) => {
             const datas = { "img_base64": String(code) };
             makeOCRRequest(apiUrl, datas,
-                function(result) {
+                function (result) {
                     if (isValidResult(result)) {
                         console.log("【我的验证码识别】p1: 识别成功", result);
                         resolve(String(result));
@@ -942,7 +1093,7 @@
                         resolve("");
                     }
                 },
-                function(error) {
+                function (error) {
                     console.log("【我的验证码识别】p1: 请求失败", error);
                     resolve("");
                 }
@@ -994,7 +1145,7 @@
         event.initEvent(eventName, true, true);
         element.dispatchEvent(event);
     }
-    
+
     /**
      * 触发 React 组件事件
      */
@@ -1002,7 +1153,7 @@
         try {
             let env = new Event(eventName);
             element.dispatchEvent(env);
-            var funName = Object.keys(element).find(p => 
+            var funName = Object.keys(element).find(p =>
                 Object.keys(element[p]).find(f => f.toLowerCase().endsWith(eventName))
             );
             if (funName != undefined) {
@@ -1011,7 +1162,7 @@
         }
         catch (e) { }
     }
-    
+
     /**
      * 触发输入框的所有事件（确保表单框架能捕获到变化）
      */
@@ -1047,19 +1198,19 @@
             console.log("【我的验证码识别】writeIn1: 结果为空");
             return;
         }
-        
+
         // 检查验证码是否匹配：使用 lastRequestedCode 而不是 preCode
         // 如果 code 存在且与 lastRequestedCode 不一致，说明验证码已更新
         if (code && lastRequestedCode && lastRequestedCode !== code) {
             console.log("【我的验证码识别】writeIn1: 验证码已更新，跳过写入 (code:", code, "lastRequestedCode:", lastRequestedCode, ")");
             return;
         }
-        
+
         if (!input) {
             console.log("【我的验证码识别】writeIn1: 输入框未定义");
             return;
         }
-        
+
         // 如果输入框为空，或者当前值不等于识别结果，则允许写入
         var currentValue = "";
         if (input.tagName == "TEXTAREA") {
@@ -1067,7 +1218,7 @@
         } else {
             currentValue = (input.value || "").trim();
         }
-        
+
         if (currentValue === "" || currentValue !== ans) {
             console.log("【我的验证码识别】writeIn1: 写入结果", ans, "(当前值:", currentValue, ")");
             if (input.tagName == "TEXTAREA") {
@@ -1085,8 +1236,10 @@
     function compareUrl() {
         return new Promise((resolve) => {
             let rules = GM_getValue("captchaRules", []);
-            let currentUrl = window.location.href.split("?")[0];
-            let matchedRule = rules.find(rule => rule.url === currentUrl);
+            let currentUrl = getCurrentPageRuleUrl();
+            let matchedRule = rules.find(function (rule) {
+                return normalizeUrlForRule(rule.url) === currentUrl;
+            });
             if (matchedRule) {
                 localRules = matchedRule;
                 resolve(true);
@@ -1147,7 +1300,7 @@
         compareUrl().then((isExist) => {
             if (isExist) {
                 exist = true;
-                captchaType = localRules["captchaType"] || "general";
+                captchaType = normalizeCaptchaType(localRules["captchaType"]);
                 if (!prepareRuleElements()) {
                     exist = false;
                     firstin = true;
@@ -1229,7 +1382,7 @@
     }
 
     // ==================== UI 工具函数 ====================
-    
+
     /**
      * 显示顶部通知
      * @param {string} msg - 消息内容
@@ -1318,25 +1471,25 @@
     }
 
     // ==================== 初始化 ====================
-    
+
     /**
      * 初始化脚本
      */
     function init() {
         console.log("【我的验证码识别】正在运行...");
-        
+
         // 检查黑名单
         var url = window.location.href;
         var blackList = GM_getValue("blackList", []);
         inBlack = blackList.some(function (blackItem) {
             return url.includes(blackItem);
         });
-        
+
         if (inBlack) {
             console.log("【我的验证码识别】当前页面在黑名单中");
             return;
         }
-        
+
         // 注册菜单
         GM_registerMenuCommand('添加当前页面规则', addRule);
         GM_registerMenuCommand('清除当前页面规则', delRule);
@@ -1344,41 +1497,41 @@
         GM_registerMenuCommand('导入规则', importRules);
         GM_registerMenuCommand('导出规则', exportRules);
         GM_registerMenuCommand('配置 Token', configureToken);
-        
+
         // 启动识别
         start();
     }
-    
+
     // 执行初始化
     init();
 
     // ==================== 事件监听 ====================
-    
+
     // 页面加载完成后再次尝试识别验证码
-    window.addEventListener('load', function() {
+    window.addEventListener('load', function () {
         if (!inBlack) {
             console.log("【我的验证码识别】页面加载完成，重新尝试识别");
-            setTimeout(function() {
+            setTimeout(function () {
                 start();
             }, 1000);
         }
     });
 
     // 页面可见性变化时也尝试重新识别
-    document.addEventListener('visibilitychange', function() {
+    document.addEventListener('visibilitychange', function () {
         if (!document.hidden && !inBlack) {
             console.log("【我的验证码识别】页面变为可见，重新尝试识别");
-            setTimeout(function() {
+            setTimeout(function () {
                 start();
             }, 500);
         }
     });
 
     // 页面DOM内容加载完成后尝试识别
-    document.addEventListener('DOMContentLoaded', function() {
+    document.addEventListener('DOMContentLoaded', function () {
         if (!inBlack) {
             console.log("【我的验证码识别】DOM内容加载完成，尝试识别");
-            setTimeout(function() {
+            setTimeout(function () {
                 start();
             }, 500);
         }
@@ -1387,41 +1540,41 @@
     // 恢复更多DOM监听功能，确保验证码识别正常工作
     setTimeout(function () {
         const targetNode = document.body;
-        const config = { 
-            attributes: true, 
-            childList: true, 
+        const config = {
+            attributes: true,
+            childList: true,
             subtree: true,
             attributeFilter: ['src', 'class', 'id', 'style'] // 恢复更多属性监听
         };
-        
+
         const callback = function (mutationsList) {
             if (inBlack) return;
-            
+
             // 节流处理，避免频繁触发
             if (domChangeTimer) {
                 clearTimeout(domChangeTimer);
             }
-            
-            domChangeTimer = setTimeout(function() {
+
+            domChangeTimer = setTimeout(function () {
                 try {
                     let hasCaptchaChange = false;
-                    
+
                     for (let mutation of mutationsList) {
                         // 检查是否有新节点添加
                         if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
                             for (let node of mutation.addedNodes) {
                                 // 检查是否添加了验证码相关元素
                                 if (node.nodeType === 1) { // 元素节点
-                                    if ((node.tagName === 'IMG' || node.tagName === 'CANVAS') && isCode.call({element: node})) {
+                                    if ((node.tagName === 'IMG' || node.tagName === 'CANVAS') && isCode.call({ element: node })) {
                                         hasCaptchaChange = true;
                                         element = node; // 更新element引用
                                         break;
                                     }
                                     // 检查子元素
-                                    const captchaElements = node.querySelectorAll && 
+                                    const captchaElements = node.querySelectorAll &&
                                         (node.querySelectorAll('img, canvas') || []);
                                     for (let elem of captchaElements) {
-                                        if (isCode.call({element: elem})) {
+                                        if (isCode.call({ element: elem })) {
                                             hasCaptchaChange = true;
                                             element = elem; // 更新element引用
                                             break;
@@ -1429,13 +1582,13 @@
                                     }
                                 }
                             }
-                        } 
+                        }
                         // 检查属性变化
                         else if (mutation.type === 'attributes') {
                             // 检查验证码元素的src变化
                             if (mutation.attributeName === 'src' && mutation.target.src) {
                                 // 检查是否是验证码元素
-                                if (isCode.call({element: mutation.target})) {
+                                if (isCode.call({ element: mutation.target })) {
                                     const now = Date.now();
                                     // 确保不是短时间内重复触发，并且src确实发生了变化
                                     if (now - lastModified > 100 && mutation.target.src !== imgSrc) {
@@ -1447,17 +1600,17 @@
                                 }
                             }
                             // 也检查其他可能的验证码相关属性变化
-                            else if ((mutation.attributeName === 'id' || mutation.attributeName === 'class') && 
-                                     mutation.target.tagName === 'IMG') {
+                            else if ((mutation.attributeName === 'id' || mutation.attributeName === 'class') &&
+                                mutation.target.tagName === 'IMG') {
                                 // 检查元素是否变成了验证码元素
-                                if (isCode.call({element: mutation.target})) {
+                                if (isCode.call({ element: mutation.target })) {
                                     hasCaptchaChange = true;
                                     element = mutation.target;
                                 }
                             }
                         }
                     }
-                    
+
                     // 只有检测到验证码相关变化时才触发识别
                     if (hasCaptchaChange) {
                         firstin = true;
@@ -1466,7 +1619,7 @@
                         // 确保始终调用pageChange进行识别
                         pageChange();
                     }
-                    
+
                     // 原有逻辑：检查现有element是否发生变化
                     if (exist && element) {
                         // 修复：确保在验证码元素src变化时正确处理
@@ -1490,7 +1643,7 @@
                 }
             }, 50); // 减少节流延迟以提高响应速度
         }
-        
+
         const observer = new MutationObserver(callback);
         observer.observe(targetNode, config);
     }, 1000);
@@ -1498,9 +1651,9 @@
     // 添加专门的验证码更新检测机制
     setTimeout(function () {
         if (inBlack) return;
-        
+
         // 定时检查验证码元素是否发生变化
-        setInterval(function() {
+        setInterval(function () {
             if (exist && element) {
                 // 对于基于规则的验证码元素
                 if (element.tagName === "IMG" && element.src && element.src !== imgSrc) {
@@ -1535,11 +1688,11 @@
                 }
             }
         }, 300); // 每300ms检查一次
-        
+
         // 特殊处理登录失败后刷新验证码的情况
-        const loginFailObserver = new MutationObserver(function(mutations) {
+        const loginFailObserver = new MutationObserver(function (mutations) {
             let loginFailDetected = false;
-            
+
             for (let mutation of mutations) {
                 // 检查新增节点
                 if (mutation.type === 'childList') {
@@ -1548,16 +1701,16 @@
                             const textContent = (node.textContent || '').toLowerCase();
                             // 检测常见的登录失败提示关键词
                             const failKeywords = ['失败', '错误', '不正确', '无效', 'error', 'fail', 'incorrect', 'wrong'];
-                            
+
                             if (failKeywords.some(keyword => textContent.includes(keyword.toLowerCase()))) {
                                 loginFailDetected = true;
                                 break;
                             }
-                            
+
                             // 检查子元素
                             if (node.querySelectorAll) {
                                 const childTexts = Array.from(node.querySelectorAll('*')).map(el => el.textContent || '');
-                                if (childTexts.some(text => 
+                                if (childTexts.some(text =>
                                     failKeywords.some(keyword => text.toLowerCase().includes(keyword)))) {
                                     loginFailDetected = true;
                                     break;
@@ -1566,19 +1719,19 @@
                         }
                     }
                 }
-                
+
                 if (loginFailDetected) break;
             }
-            
+
             // 如果检测到登录失败，等待验证码刷新后重新识别
             if (loginFailDetected) {
                 console.log("【我的验证码识别】检测到登录失败，等待验证码刷新后重新识别");
-                setTimeout(function() {
+                setTimeout(function () {
                     firstin = true;
                     GM_setValue("preCode", "");
                     lastRequestedCode = "";
                     imgSrc = ""; // 清除之前的src记录
-                    
+
                     if (exist) {
                         pageChange();
                     } else {
@@ -1587,7 +1740,7 @@
                 }, 500); // 等待500ms确保验证码刷新完成
             }
         });
-        
+
         // 观察整个文档的变化
         loginFailObserver.observe(document.body, {
             childList: true,
