@@ -889,7 +889,8 @@ async def admin_login_page():
                         const nonceData = await nonceResp.json();
                         const nonce = nonceData.nonce;
                         const passwordSig = await sha256Hex(`${username}:${password}:${nonce}`);
-                        body = { username: username, nonce: nonce, password_sig: passwordSig };
+                        // 默认走加密登录，携带明文作为多进程/多实例场景下的回退
+                        body = { username: username, password: password, nonce: nonce, password_sig: passwordSig };
                     }
                 } catch (err) {
                     // 兼容不支持 WebCrypto 的环境：退回明文（建议部署侧配合内网/反代/HTTPS）
@@ -1005,16 +1006,21 @@ async def admin_login(login_data: LoginModel, request: Request):
     password_sig = (login_data.password_sig or "").strip() if login_data.password_sig is not None else None
 
     authenticated = False
+    nonce_checked = False
 
     if nonce and password_sig:
         if consume_login_nonce(nonce):
+            nonce_checked = True
             expected = compute_admin_login_sig(username, ADMIN_PASSWORD, nonce)
             authenticated = hmac.compare_digest(str(username), str(ADMIN_USERNAME)) and hmac.compare_digest(password_sig, expected)
-        else:
+        elif password is None:
+            # 老版本前端不带明文时，直接提示过期
             raise HTTPException(status_code=401, detail="登录凭证过期，请刷新重试")
-    elif password is not None:
+    
+    if not authenticated and password is not None:
         authenticated = verify_admin_credentials(username, password)
-    else:
+    
+    if password is None and not nonce_checked and not password_sig:
         raise HTTPException(status_code=400, detail="请求参数错误")
 
     if authenticated:
