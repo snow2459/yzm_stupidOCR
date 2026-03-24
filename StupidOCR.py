@@ -372,27 +372,65 @@ def refresh_token_cache():
         rate_limit_state = {k: v for k, v in rate_limit_state.items() if k in token_value_map}
 
 
+def build_db_init_error_message(exc: sqlite3.OperationalError) -> str:
+    """构建数据库初始化失败时的可读错误信息"""
+    error_text = str(exc).lower()
+    db_dir = os.path.dirname(TOKEN_DB_PATH) or "."
+
+    if os.path.isdir(TOKEN_DB_PATH):
+        return (
+            f"TOKEN_DB_PATH 指向了目录而不是 SQLite 文件：{TOKEN_DB_PATH}。"
+            f"如果使用 Docker 单文件挂载，请先在宿主机创建该文件；"
+            f"否则更推荐直接挂载目录到 {db_dir}。"
+        )
+
+    if "readonly" in error_text:
+        return (
+            f"SQLite 数据库文件不可写：{TOKEN_DB_PATH}。"
+            f"请确认宿主机挂载文件及其所在目录对容器内进程可写。"
+        )
+
+    if "unable to open database file" in error_text:
+        return (
+            f"无法打开 SQLite 数据库文件：{TOKEN_DB_PATH}。"
+            f"请确认父目录 {db_dir} 存在且可写；如果使用 Docker 单文件挂载，"
+            f"请先在宿主机创建数据库文件，避免 Docker 自动把宿主机路径创建成目录。"
+        )
+
+    return f"初始化 SQLite 数据库失败：{exc}"
+
+
 def init_db():
     """初始化 SQLite 数据库并加载缓存"""
-    db_dir = os.path.dirname(TOKEN_DB_PATH)
+    db_dir = os.path.dirname(TOKEN_DB_PATH) or "."
     if db_dir and not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
-    
-    conn = get_db_connection()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token TEXT NOT NULL,
-            name TEXT,
-            created_at TEXT,
-            updated_at TEXT,
-            minute_limit INTEGER,
-            hour_limit INTEGER,
-            usage_count INTEGER DEFAULT 0
+
+    if os.path.isdir(TOKEN_DB_PATH):
+        raise RuntimeError(
+            f"TOKEN_DB_PATH 指向了目录而不是 SQLite 文件：{TOKEN_DB_PATH}。"
+            f"如果使用 Docker 单文件挂载，请先在宿主机创建该文件；"
+            f"否则更推荐直接挂载目录到 {db_dir}。"
         )
-    """)
-    conn.commit()
-    conn.close()
+
+    try:
+        conn = get_db_connection()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL,
+                name TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                minute_limit INTEGER,
+                hour_limit INTEGER,
+                usage_count INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(build_db_init_error_message(exc)) from exc
     
     refresh_token_cache()
     try:

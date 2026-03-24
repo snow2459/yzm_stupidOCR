@@ -50,6 +50,24 @@ docker run -d \
   stupidocr:x64
 ```
 
+如果你想把数据库持久化到宿主机单文件，也可以这样：
+```shell
+touch /opt/tokens.db
+chmod 666 /opt/tokens.db
+
+docker run -d \
+  --name stupidocr \
+  -p 6688:6688 \
+  -e TOKEN_DB_PATH=/data/tokens.db \
+  -v /opt/tokens.db:/data/tokens.db \
+  stupidocr:x64
+```
+
+注意：
+- 更推荐挂载目录到容器 `/data`，比单文件挂载更稳妥。
+- 如果使用单文件挂载，宿主机文件必须预先创建且可写；否则 Docker 可能把宿主机路径创建成目录，最终触发 `unable to open database file`。
+- 如果宿主机文件或其父目录不可写，SQLite 会报 `attempt to write a readonly database`。
+
 ## 优化说明
 - 通用 `image` 模型在启动时预热并常驻，避免最常用接口出现空闲后的冷启动。
 - 其他 OCR 模型按需加载，空闲后自动释放，适合偶发请求的小型云主机。
