@@ -1,5 +1,6 @@
 # Token 配置文件（包含敏感信息）
 .token_config.json
+tokens.db
 
 # Python
 __pycache__/
@@ -36,4 +37,3 @@ wheels/
 # OS
 .DS_Store
 Thumbs.db
-

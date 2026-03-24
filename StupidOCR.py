@@ -3,26 +3,38 @@ StupidOCR - 基于 DDDDOCR 的验证码识别服务
 提供多种验证码识别接口，支持 Token 认证和管理
 """
 
-import ddddocr
-import uvicorn
+import os
+import gc
 import base64
+import binascii
+from contextlib import contextmanager
 import re
-import json
 import secrets
 import sqlite3
 import threading
 import time
 import hashlib
 import hmac
+from datetime import datetime
 from io import BytesIO
+from typing import Callable, Dict, Generator, List, Optional
+
+# 小机器默认限制底层推理库的线程与内存碎片，用户可通过环境变量覆盖
+DEFAULT_OCR_CPU_THREADS = os.environ.get("OCR_CPU_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", DEFAULT_OCR_CPU_THREADS)
+os.environ.setdefault("OPENBLAS_NUM_THREADS", DEFAULT_OCR_CPU_THREADS)
+os.environ.setdefault("MKL_NUM_THREADS", DEFAULT_OCR_CPU_THREADS)
+os.environ.setdefault("NUMEXPR_NUM_THREADS", DEFAULT_OCR_CPU_THREADS)
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
+import ddddocr
+import uvicorn
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from pydantic import BaseModel, Field, validator
 from fastapi.middleware.cors import CORSMiddleware
-import os
-from datetime import datetime
-from typing import Optional, List, Dict
 
 # ==================== 配置 ====================
 APP_VERSION = "1.2.0"
@@ -41,10 +53,18 @@ APP_DESCRIPTION = """
 MAX_IMAGE_SIZE = int(os.environ.get("MAX_IMAGE_SIZE", 5 * 1024 * 1024))
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "yzm_admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "7jnyxx54")
+OCR_MODEL_IDLE_SECONDS = max(int(os.environ.get("OCR_MODEL_IDLE_SECONDS", "300")), 0)
+UVICORN_ACCESS_LOG = str(os.environ.get("UVICORN_ACCESS_LOG", "1")).lower() in {"1", "true", "yes", "on"}
 
 # 文件路径
 BASE_DIR = os.path.dirname(__file__)
 TOKEN_DB_PATH = os.environ.get("TOKEN_DB_PATH", os.path.join(BASE_DIR, "tokens.db"))
+ADMIN_TEMPLATE_PATH = os.path.join(BASE_DIR, "admin_template.html")
+try:
+    with open(ADMIN_TEMPLATE_PATH, "r", encoding="utf-8") as template_file:
+        ADMIN_TEMPLATE_HTML = template_file.read()
+except FileNotFoundError:
+    ADMIN_TEMPLATE_HTML = ""
 
 # 全局对象
 app = FastAPI(
@@ -72,17 +92,153 @@ login_nonces_lock = threading.Lock()
 LOGIN_NONCE_TTL_SECONDS = 60
 
 # ==================== OCR 模型初始化 ====================
-ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
-number_ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
-number_ocr.set_ranges(0)
-compute_ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
-compute_ocr.set_ranges("0123456789+-x÷=")
-alphabet_ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
-alphabet_ocr.set_ranges(3)
-det = ddddocr.DdddOcr(det=True, show_ad=False)
-shadow_slide = ddddocr.DdddOcr(det=False, ocr=False, show_ad=False)
+def build_common_ocr() -> ddddocr.DdddOcr:
+    return ddddocr.DdddOcr(show_ad=False, beta=True)
+
+
+def build_number_ocr() -> ddddocr.DdddOcr:
+    model = ddddocr.DdddOcr(show_ad=False, beta=True)
+    model.set_ranges(0)
+    return model
+
+
+def build_compute_ocr() -> ddddocr.DdddOcr:
+    model = ddddocr.DdddOcr(show_ad=False, beta=True)
+    model.set_ranges("0123456789+-x÷=")
+    return model
+
+
+def build_alphabet_ocr() -> ddddocr.DdddOcr:
+    model = ddddocr.DdddOcr(show_ad=False, beta=True)
+    model.set_ranges(3)
+    return model
+
+
+def build_det_ocr() -> ddddocr.DdddOcr:
+    return ddddocr.DdddOcr(det=True, show_ad=False)
+
+
+def build_shadow_slide_ocr() -> ddddocr.DdddOcr:
+    return ddddocr.DdddOcr(det=False, ocr=False, show_ad=False)
+
+
+OCR_MODEL_BUILDERS: Dict[str, Callable[[], ddddocr.DdddOcr]] = {
+    "common": build_common_ocr,
+    "number": build_number_ocr,
+    "compute": build_compute_ocr,
+    "alphabet": build_alphabet_ocr,
+    "det": build_det_ocr,
+    "shadow_slide": build_shadow_slide_ocr,
+}
+OCR_PERSISTENT_MODELS = {"common"}
+
+
+class OCRModelManager:
+    """按需加载 OCR 模型，并在空闲后自动释放"""
+
+    def __init__(self, idle_seconds: int, persistent_models: Optional[set] = None):
+        self.idle_seconds = idle_seconds
+        self.persistent_models = persistent_models or set()
+        self.instances: Dict[str, ddddocr.DdddOcr] = {}
+        self.last_used_at: Dict[str, float] = {}
+        self.active_counts: Dict[str, int] = {}
+        self.model_locks: Dict[str, threading.Lock] = {}
+        self.manager_lock = threading.Lock()
+        self.cleanup_thread: Optional[threading.Thread] = None
+
+    def preload(self, model_name: str):
+        with self.manager_lock:
+            if model_name in self.instances:
+                self.last_used_at[model_name] = time.time()
+                return
+            builder = OCR_MODEL_BUILDERS[model_name]
+            self.instances[model_name] = builder()
+            self.last_used_at[model_name] = time.time()
+            self.model_locks.setdefault(model_name, threading.Lock())
+
+    def start_cleanup_worker(self):
+        if self.idle_seconds <= 0:
+            return
+        if self.cleanup_thread and self.cleanup_thread.is_alive():
+            return
+        self.cleanup_thread = threading.Thread(target=self.cleanup_worker, daemon=True)
+        self.cleanup_thread.start()
+
+    def get_loaded_models(self) -> List[str]:
+        with self.manager_lock:
+            return list(self.instances.keys())
+
+    @contextmanager
+    def acquire(self, model_name: str) -> Generator[ddddocr.DdddOcr, None, None]:
+        with self.manager_lock:
+            model = self.instances.get(model_name)
+            if model is None:
+                builder = OCR_MODEL_BUILDERS[model_name]
+                model = builder()
+                self.instances[model_name] = model
+            self.active_counts[model_name] = self.active_counts.get(model_name, 0) + 1
+            self.last_used_at[model_name] = time.time()
+            model_lock = self.model_locks.setdefault(model_name, threading.Lock())
+
+        try:
+            with model_lock:
+                yield model
+        finally:
+            with self.manager_lock:
+                active_count = self.active_counts.get(model_name, 1) - 1
+                if active_count > 0:
+                    self.active_counts[model_name] = active_count
+                else:
+                    self.active_counts.pop(model_name, None)
+                self.last_used_at[model_name] = time.time()
+
+    def cleanup_worker(self):
+        interval = max(5, min(self.idle_seconds, 60))
+        while True:
+            time.sleep(interval)
+            now = time.time()
+            unloaded = False
+
+            with self.manager_lock:
+                idle_model_names = [
+                    model_name
+                    for model_name, _ in self.instances.items()
+                    if model_name not in self.persistent_models
+                    if self.active_counts.get(model_name, 0) == 0
+                    and now - self.last_used_at.get(model_name, now) >= self.idle_seconds
+                ]
+                for model_name in idle_model_names:
+                    self.instances.pop(model_name, None)
+                    self.last_used_at.pop(model_name, None)
+                    self.active_counts.pop(model_name, None)
+                    unloaded = True
+
+            if unloaded:
+                gc.collect()
+
+
+ocr_models = OCRModelManager(OCR_MODEL_IDLE_SECONDS, OCR_PERSISTENT_MODELS)
 
 # ==================== 工具函数 ====================
+def normalize_base64_image(img_base64: str) -> str:
+    """标准化 base64 图片字符串，兼容 data URI 前缀"""
+    normalized = (img_base64 or "").strip()
+    if not normalized:
+        raise ValueError("图片数据不能为空")
+
+    if normalized.startswith("data:") and "," in normalized:
+        normalized = normalized.split(",", 1)[1].strip()
+
+    if not normalized:
+        raise ValueError("图片数据不能为空")
+    return normalized
+
+
+def estimate_base64_decoded_size(img_base64: str) -> int:
+    """根据 base64 长度估算解码后的字节数，避免超大图片先落入内存"""
+    padding = len(img_base64) - len(img_base64.rstrip("="))
+    return max((len(img_base64) * 3) // 4 - padding, 0)
+
 
 def safe_eval_arithmetic(expression: str) -> float:
     """
@@ -128,25 +284,31 @@ def validate_image_size(img_base64: str, max_size: int = MAX_IMAGE_SIZE) -> byte
     验证 base64 图片大小并返回解码后的图片数据
     """
     try:
-        img_data = base64.b64decode(img_base64)
-        
+        normalized = normalize_base64_image(img_base64)
+        estimated_size = estimate_base64_decoded_size(normalized)
+        if estimated_size > max_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"图片大小超过限制，最大允许 {max_size / 1024 / 1024:.2f}MB"
+            )
+
+        img_data = base64.b64decode(normalized, validate=True)
         if len(img_data) > max_size:
             raise HTTPException(
                 status_code=400,
                 detail=f"图片大小超过限制，最大允许 {max_size / 1024 / 1024:.2f}MB"
             )
-        
         # 验证是否为有效图片
         try:
-            img = Image.open(BytesIO(img_data))
-            img.verify()
+            with Image.open(BytesIO(img_data)) as img:
+                img.verify()
         except Exception:
             raise HTTPException(status_code=400, detail="无效的图片格式")
-        
+
         return img_data
     except HTTPException:
         raise
-    except Exception as e:
+    except (ValueError, binascii.Error) as e:
         raise HTTPException(status_code=400, detail=f"图片解码失败: {str(e)}")
 
 
@@ -157,7 +319,6 @@ def extract_text_from_probability(result: Dict) -> str:
 # ==================== Token 管理 ====================
 
 token_cache: List[Dict] = []
-token_value_cache = set()
 token_value_map: Dict[str, Dict] = {}
 token_cache_lock = threading.Lock()
 rate_limit_state: Dict[str, Dict] = {}
@@ -202,14 +363,13 @@ def load_tokens_from_db() -> List[Dict]:
 
 def refresh_token_cache():
     """刷新 Token 缓存"""
-    global token_cache, token_value_cache, token_value_map, rate_limit_state
+    global token_cache, token_value_map, rate_limit_state
     tokens = load_tokens_from_db()
     with token_cache_lock:
         token_cache = tokens
-        token_value_cache = {t['token'] for t in tokens if t.get('token')}
         token_value_map = {t['token']: t for t in tokens if t.get('token')}
         # 清理已删除 token 的限流状态
-        rate_limit_state = {k: v for k, v in rate_limit_state.items() if k in token_value_cache}
+        rate_limit_state = {k: v for k, v in rate_limit_state.items() if k in token_value_map}
 
 
 def init_db():
@@ -352,10 +512,6 @@ def schedule_usage_increment(token_value: str):
         token_data = token_value_map.get(token_value)
         if token_data:
             token_data['usage_count'] = (token_data.get('usage_count') or 0) + 1
-            for cached in token_cache:
-                if cached.get('token') == token_value:
-                    cached['usage_count'] = token_data['usage_count']
-                    break
     
     with usage_queue_lock:
         usage_increment_queue[token_value] = usage_increment_queue.get(token_value, 0) + 1
@@ -384,7 +540,6 @@ def usage_flush_worker():
             )
         conn.commit()
         conn.close()
-        refresh_token_cache()
 
 
 def start_usage_flush_worker():
@@ -488,14 +643,13 @@ async def verify_token(x_token: Optional[str] = Header(None, alias="X-Token")):
         raise HTTPException(status_code=403, detail="缺少 Token，请在请求头中添加 X-Token")
     
     with token_cache_lock:
-        cached_tokens = list(token_cache)
-        cached_token_values = set(token_value_cache)
+        has_tokens = bool(token_cache)
         token_config = token_value_map.get(x_token)
     
-    if not cached_tokens:
+    if not has_tokens:
         raise HTTPException(status_code=403, detail="Token 未配置，请先访问管理界面配置 Token")
     
-    if x_token not in cached_token_values or not token_config:
+    if not token_config:
         raise HTTPException(status_code=403, detail="Token 验证失败")
     
     enforce_rate_limit(
@@ -512,6 +666,8 @@ async def verify_token(x_token: Optional[str] = Header(None, alias="X-Token")):
 # 初始化数据库与缓存
 init_db()
 start_usage_flush_worker()
+ocr_models.preload("common")
+ocr_models.start_cleanup_worker()
 
 # ==================== 数据模型 ====================
 
@@ -521,13 +677,7 @@ class ModelImageIn(BaseModel):
     
     @validator('img_base64')
     def validate_base64(cls, v):
-        if not v or len(v) == 0:
-            raise ValueError("图片数据不能为空")
-        try:
-            base64.b64decode(v, validate=True)
-        except Exception:
-            raise ValueError("无效的 base64 编码")
-        return v
+        return normalize_base64_image(v)
 
 
 class ModelSliderImageIn(BaseModel):
@@ -537,13 +687,7 @@ class ModelSliderImageIn(BaseModel):
     
     @validator('gapimg_base64', 'fullimg_base64')
     def validate_base64(cls, v):
-        if not v or len(v) == 0:
-            raise ValueError("图片数据不能为空")
-        try:
-            base64.b64decode(v, validate=True)
-        except Exception:
-            raise ValueError("无效的 base64 编码")
-        return v
+        return normalize_base64_image(v)
 
 
 class LoginModel(BaseModel):
@@ -600,7 +744,8 @@ class TokenUpdateModel(BaseModel):
 async def ocr_image(data: ModelImageIn, token: str = Depends(verify_token)):
     """通用验证码识别"""
     img = validate_image_size(data.img_base64)
-    result = ocr.classification(img)
+    with ocr_models.acquire("common") as model:
+        result = model.classification(img)
     return {"result": result}
 
 
@@ -608,7 +753,8 @@ async def ocr_image(data: ModelImageIn, token: str = Depends(verify_token)):
 async def ocr_image_number(data: ModelImageIn, token: str = Depends(verify_token)):
     """数字验证码识别"""
     img = validate_image_size(data.img_base64)
-    result = number_ocr.classification(img, probability=True)
+    with ocr_models.acquire("number") as model:
+        result = model.classification(img, probability=True)
     string = extract_text_from_probability(result)
     return {"result": string}
 
@@ -617,7 +763,8 @@ async def ocr_image_number(data: ModelImageIn, token: str = Depends(verify_token
 async def ocr_image_compute(data: ModelImageIn, token: str = Depends(verify_token)):
     """算术验证码识别"""
     img = validate_image_size(data.img_base64)
-    result = compute_ocr.classification(img, probability=True)
+    with ocr_models.acquire("compute") as model:
+        result = model.classification(img, probability=True)
     string = extract_text_from_probability(result)
     string = string.split("=")[0].replace("x", "*").replace("÷", "/")
     
@@ -636,7 +783,8 @@ async def ocr_image_compute(data: ModelImageIn, token: str = Depends(verify_toke
 async def ocr_image_alphabet(data: ModelImageIn, token: str = Depends(verify_token)):
     """字母验证码识别"""
     img = validate_image_size(data.img_base64)
-    result = alphabet_ocr.classification(img, probability=True)
+    with ocr_models.acquire("alphabet") as model:
+        result = model.classification(img, probability=True)
     string = extract_text_from_probability(result)
     return {"result": string}
 
@@ -645,15 +793,16 @@ async def ocr_image_alphabet(data: ModelImageIn, token: str = Depends(verify_tok
 async def ocr_image_det(data: ModelImageIn, token: str = Depends(verify_token)):
     """文字点选验证码识别"""
     img = validate_image_size(data.img_base64)
-    img_pil = Image.open(BytesIO(img))
-    res = det.detection(img)
-    result = {
-        ocr.classification(img_pil.crop(box)): [
-            box[0] + (box[2] - box[0]) // 2,
-            box[1] + (box[3] - box[1]) // 2
-        ]
-        for box in res
-    }
+    with ocr_models.acquire("det") as det_model, ocr_models.acquire("common") as common_model:
+        res = det_model.detection(img)
+        with Image.open(BytesIO(img)) as img_pil:
+            result = {
+                common_model.classification(img_pil.crop(box)): [
+                    box[0] + (box[2] - box[0]) // 2,
+                    box[1] + (box[3] - box[1]) // 2
+                ]
+                for box in res
+            }
     return {"result": result}
 
 
@@ -662,7 +811,8 @@ async def ocr_image_slider_gap(data: ModelSliderImageIn, token: str = Depends(ve
     """缺口滑块验证码识别"""
     gapimg = validate_image_size(data.gapimg_base64)
     fullimg = validate_image_size(data.fullimg_base64)
-    result = det.slide_match(gapimg, fullimg)
+    with ocr_models.acquire("det") as det_model:
+        result = det_model.slide_match(gapimg, fullimg)
     return {"result": result}
 
 
@@ -671,7 +821,8 @@ async def ocr_image_slider_shadow(data: ModelSliderImageIn, token: str = Depends
     """阴影滑块验证码识别"""
     shadowimg = validate_image_size(data.gapimg_base64)
     fullimg = validate_image_size(data.fullimg_base64)
-    result = shadow_slide.slide_comparison(shadowimg, fullimg)
+    with ocr_models.acquire("shadow_slide") as model:
+        result = model.slide_comparison(shadowimg, fullimg)
     return {"result": result}
 
 # ==================== 管理界面路由 ====================
@@ -971,10 +1122,10 @@ async def admin_page(request: Request):
         token_list_html = '<tr><td colspan="7" style="text-align: center; color: #999;">暂无 Token</td></tr>'
     
     # 读取模板文件
-    template_path = os.path.join(os.path.dirname(__file__), "admin_template.html")
     try:
-        with open(template_path, 'r', encoding='utf-8') as f:
-            html_content = f.read()
+        html_content = ADMIN_TEMPLATE_HTML
+        if not html_content:
+            raise FileNotFoundError
         html_content = html_content.replace('{status_class}', status_class)
         html_content = html_content.replace('{status_text}', status_text)
         html_content = html_content.replace('{token_count}', str(token_count))
@@ -1189,7 +1340,7 @@ if __name__ == '__main__':
         "StupidOCR:app",
         host="0.0.0.0",
         port=6688,
-        access_log=True,
+        access_log=UVICORN_ACCESS_LOG,
         workers=workers,
         reload=False
     )

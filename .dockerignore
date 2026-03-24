@@ -5,7 +5,15 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.venv
+.venv/
 .env
 .DS_Store
 *.log
+*.db
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+README.md
+AGENTS.md
+my.js
+vercel.json
